@@ -15,7 +15,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "sqlalchemy[asyncio]>=2"]
+dev = [
+    "pytest>=8",
+    "sqlalchemy[asyncio]>=2",
+    "reasonhold @ git+https://github.com/Silicon-Wraith/ReasonHold@v0.1.1",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
