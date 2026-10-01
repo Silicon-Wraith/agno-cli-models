@@ -11,4 +11,4 @@ areas:
     description: Agno models backed by the Claude Code and Codex CLIs (src/agno_cli_models and its tests)
     projects: [agno_cli_models]
     docs: [README.md]
-    index: ["src/agno_cli_models/*.py", "src/agno_cli_models/**/*.py", "tests/*.py"]
+    index: ["src/agno_cli_models/*.py", "src/agno_cli_models/**/*.py", "tests/*.py", "reports/*.md"]

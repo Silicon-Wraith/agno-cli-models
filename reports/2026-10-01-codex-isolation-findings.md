@@ -1,6 +1,6 @@
 # Codex isolation: what codex app-server 0.155.1 lets us turn off
 
-Investigation for the Sendesis request `request-agno-cli-models-codex-isolation-leak` (dec-477114059d7c). Status: investigation done. Decisions open (see the end).
+Investigation for the Sendesis request `request-agno-cli-models-codex-isolation-leak` (dec-477114059d7c). Status: done. Decisions and the implementation are at the end.
 
 ## Method
 
@@ -57,6 +57,8 @@ Five low-effort turns on `gpt-5.6-sol`, on 2026-10-01 between 16:12 and 16:20 lo
 | 4 `01a0f9c3-2c16` | set 2 and `features.code_mode_host=false` | same as turn 3 | **Tool call failed: "code-mode host is disabled"** |
 | 5 `01a0f9c3-c240` | set 2 and `model_catalog_json` = a copy of `models_cache.json` with `gpt-5.6-sol.multi_agent_version = "disabled"` | permissions, environment_context only | `functions.exec`, `functions.wait`, `tools.get_secret`, `tools.skills__list`, `tools.skills__read`. **No collaboration tools**; `get_secret` worked |
 
+Turn 6 (`01a0f9c9-4ec8`) used the implemented `app_server_argv()`: set 2, with no catalog override, and `agents.max_concurrent_threads_per_session=1`. The model was asked to call `collaboration.spawn_agent`. **The spawn succeeded** (`{"task_name":"/root/reply_ok"}`). Child thread `01a0f9c9-5b56` ran a turn with its own prompt, "You are an agent in a team of agents ...", which `subagent_usage_hint_text` controls. The cap therefore does not count the root agent, and 0 is rejected, so it does not prevent sub-agents. The parent rollout records a `SubAgentActivity` item.
+
 In turns 3–5 the logged feature list no longer has SleepTool, CodexHooks, ShellSnapshot, Collab, ToolSuggest, Plugins, BrowserUse, ComputerUse, RemotePlugin, ImageGeneration, SkillMcpDependencyInstall, SkillSearch, Goals or Personality.
 
 ### Override set 1 (all validated with `--strict-config`)
@@ -109,7 +111,7 @@ skills.config=[{path="<CODEX_HOME>/skills/<name>/SKILL.md", enabled=false}, ...]
 | User skills (`~/.codex/skills`) | yes, by enumeration | `skills.config=[{path, enabled=false}]` per skill |
 | `<plugins_instructions>` and plugin skills | yes | `features.plugins=false`, `features.remote_plugin=false` |
 | `/root` multi-agent prompt, `<multi_agent_mode>` | yes | blank `features.multi_agent_v2.root_agent_usage_hint_text` and `multi_agent_mode_hint_text` |
-| Collaboration tools (`spawn_agent` and others) | **not through config** | `multi_agent_version: v2` is a property of the model in the catalog. Only a `model_catalog_json` override removed them (turn 5). Without it, the mitigation is `wait_agent_enabled=false` and `max_concurrent_threads_per_session=1` |
+| Collaboration tools (`spawn_agent` and others) | **not through config** | `multi_agent_version: v2` is a property of the model in the catalog. Only a `model_catalog_json` override removed them (turn 5). `max_concurrent_threads_per_session=1` does not stop a spawn (turn 6) |
 | SleepTool, CodexHooks, ShellSnapshot | yes | `features.sleep_tool`, `features.hooks`, `features.shell_snapshot` set to false |
 | Memories | already off; now pinned | `memories.use_memories=false`, `memories.generate_memories=false` |
 | Personality | yes | `features.personality=false`, plus `personality: "none"` on `thread/start` |
@@ -118,20 +120,21 @@ skills.config=[{path="<CODEX_HOME>/skills/<name>/SKILL.md", enabled=false}, ...]
 | `functions.exec`, `functions.wait` | **must stay** | `tool_mode: code_mode_only`: Agno's dynamic tools are called through exec (turn 4 broke tool calls) |
 | `<permissions instructions>`, `<environment_context>` | keep | Describe this call's sandbox, date and timezone, not user setup |
 
-## Open decisions
+## Decisions (maintainer, 2026-10-01)
 
-1. **Collaboration tools.** Options:
-   - (a) Document them as a model-catalog property that config cannot disable, and apply the mitigations.
-   - (b) Generate a patched `model_catalog_json` from `$CODEX_HOME/models_cache.json` on each call. This pins model metadata to that snapshot and depends on the cache's format, in a package whose premise is "the real CLI as installed".
-   - (c) Make (b) opt-in.
-2. **`skills__list` / `skills__read`.** Document them as remaining, since no lever was found.
-3. **`ShellTool`, `UnifiedExec`, `ViewImage` with `builtin_tools=False`.** These are already hidden by `environments: []` (none were model-reported). Disabling them too would be defence in depth, but only when `builtin_tools=False`, because they are the built-in tools.
+1. **Collaboration tools: document only.**
+   - Rejected: a patched `model_catalog_json`, always on or opt-in. It depends on the cache's format and pins model metadata, in a package whose premise is "the real CLI as installed".
+   - Rejected: a client-side guard that fails the call when a spawn is seen.
+   - Not shipped: the ineffective `wait_agent_enabled=false` and `max_concurrent_threads_per_session=1`, so that nothing suggests a guard that does not exist.
+   - `multi_agent_mode_hint_text` is **not** blanked. With the tools still offered, Codex's `<multi_agent_mode>` "do not spawn unless asked" line is the only thing discouraging a spawn. Only the `/root` delegation prompt is blanked.
+2. **`skills__list` / `skills__read`: documented as remaining.**
+3. **No extra feature flags for ShellTool, UnifiedExec or ViewImage when `builtin_tools=False`.** `environments: []` already hides them.
 
-## For the implementation PR
+## Implemented
 
-- `FIXED_CONFIG` gains set 2, minus the per-path skills entries, which are built at spawn time like `_user_mcp_overrides()`.
-- `config_fingerprint()` covers FIXED_CONFIG automatically. It should also record `user_skills: disabled` and `personality: none`, and the catalog choice if (b) or (c) is adopted.
-- `personality: "none"` also goes on `thread/resume`.
-- A no-quota test can run `codex app-server --strict-config -c k=v </dev/null` for every FIXED_CONFIG key and flag a renamed key when Codex is upgraded. Mark it as needing the codex binary.
-- README Isolation and Known limits get the table above.
-- `~/.codex/AGENTS.md` does not exist on this machine. `project_doc_max_bytes=0` is a valid key but untested here.
+- `FIXED_CONFIG` is set 2 without `wait_agent_enabled`, `max_concurrent_threads_per_session` or `multi_agent_mode_hint_text`. The per-path `skills.config` is built at spawn time from `$CODEX_HOME/skills/**/SKILL.md`, skipping dot-directories.
+- `personality: "none"` goes on `thread/start` and `thread/resume`.
+- `fingerprint()` covers FIXED_CONFIG, plus `user_skills: disabled` and `personality: none`.
+- A unit test runs the real argv under `codex app-server --strict-config </dev/null`. It is skipped without the binary or on an untested version, and catches a renamed key without a model call; a bogus key exits 1.
+- An integration test reads the call's rollout and checks for no skills, plugins, apps or `/root` blocks, `<multi_agent_mode>` present, and personality `none`.
+- `~/.codex/AGENTS.md` does not exist on this machine, and `project_doc_max_bytes` is left alone. It stays under Known limits.

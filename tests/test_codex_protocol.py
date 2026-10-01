@@ -1,6 +1,10 @@
+import shutil
+import subprocess
+
 import pytest
 from agno.models.message import Message
 
+from agno_cli_models._env import clean_env
 from agno_cli_models.codex.protocol import (
     TurnTracker,
     app_server_argv,
@@ -11,12 +15,51 @@ from agno_cli_models.codex.protocol import (
     turn_start_params,
 )
 from agno_cli_models.errors import CliProtocolError, ContextWindowExceededError, ModelProviderError, ModelRateLimitError
+from agno_cli_models.versions import SUPPORTED, installed_version
 
 
 def test_app_server_argv_isolates():
     argv = app_server_argv("codex")
     assert argv[:2] == ["codex", "app-server"]
     assert "features.apps=false" in argv and 'web_search="disabled"' in argv
+    for kv in ("skills.include_instructions=false", "skills.bundled.enabled=false", "features.plugins=false",
+               "features.hooks=false", "memories.use_memories=false", "features.personality=false",
+               'features.multi_agent_v2.root_agent_usage_hint_text=""'):
+        assert kv in argv
+    assert not [a for a in argv if "multi_agent_mode_hint_text" in a]  # keeps "do not spawn unless asked"
+    assert all(flag == "-c" for flag in argv[2::2])
+
+
+def test_user_skills_are_disabled_by_path(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    for rel in ("skills/alpha/SKILL.md", "skills/group/beta/SKILL.md", "skills/.system/bundled/SKILL.md"):
+        (tmp_path / rel).parent.mkdir(parents=True)
+        (tmp_path / rel).write_text("---\nname: x\n---\n")
+    [entry] = [a for a in app_server_argv("codex") if a.startswith("skills.config=")]
+    assert f'path="{tmp_path}/skills/alpha/SKILL.md", enabled=false' in entry
+    assert f'path="{tmp_path}/skills/group/beta/SKILL.md", enabled=false' in entry
+    assert ".system" not in entry
+
+
+def test_no_user_skills_means_no_skills_config(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    assert not [a for a in app_server_argv("codex") if a.startswith("skills.config")]
+
+
+@pytest.mark.skipif(shutil.which("codex") is None, reason="needs the codex binary")
+def test_fixed_config_keys_exist_in_installed_codex(tmp_path, monkeypatch):
+    """--strict-config rejects unknown -c keys, so a key Codex renamed fails here without a model call."""
+    version = installed_version("codex")
+    if version not in SUPPORTED["codex"]:
+        pytest.skip(f"codex {version} is not a tested version")
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    (tmp_path / "config.toml").write_text('[mcp_servers.docs]\ncommand = "x"\n')
+    (tmp_path / "skills" / "alpha").mkdir(parents=True)
+    (tmp_path / "skills" / "alpha" / "SKILL.md").write_text("---\nname: alpha\ndescription: x\n---\n")
+    argv = app_server_argv("codex")
+    done = subprocess.run([argv[0], argv[1], "--strict-config", *argv[2:]], stdin=subprocess.DEVNULL,
+                          capture_output=True, text=True, timeout=60, env=clean_env())
+    assert done.returncode == 0 and "Error" not in done.stderr, done.stderr
 
 
 def test_thread_start_params_pin_everything():
@@ -25,6 +68,7 @@ def test_thread_start_params_pin_everything():
     assert p["sandbox"] == "read-only" and p["approvalPolicy"] == "never"
     assert p["allowProviderModelFallback"] is False
     assert p["environments"] == [] and p["dynamicTools"] == [{"name": "t"}]
+    assert p["personality"] == "none"
 
 
 def test_builtin_tools_keep_the_environment():
@@ -39,7 +83,7 @@ def test_danger_sandbox_refused():
 
 def test_resume_and_turn_params():
     r = thread_resume_params(thread_id="t1", model_id="m", system="S", cwd="/w", sandbox="read-only")
-    assert r["threadId"] == "t1" and r["model"] == "m"
+    assert r["threadId"] == "t1" and r["model"] == "m" and r["personality"] == "none"
     t = turn_start_params(thread_id="t1", text="hi", effort="high", builtin_tools=False, output_schema={"type": "object", "properties": {"a": {"type": "string"}}})
     assert t["input"] == [{"type": "text", "text": "hi"}] and t["effort"] == "high" and t["environments"] == []
     assert t["outputSchema"]["required"] == ["a"]
