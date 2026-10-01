@@ -10,7 +10,7 @@ from agno_cli_models.codex.protocol import (
     thread_start_params,
     turn_start_params,
 )
-from agno_cli_models.errors import ContextWindowExceededError, ModelProviderError, ModelRateLimitError
+from agno_cli_models.errors import CliProtocolError, ContextWindowExceededError, ModelProviderError, ModelRateLimitError
 
 
 def test_app_server_argv_isolates():
@@ -130,3 +130,23 @@ def test_user_mcp_servers_are_disabled(tmp_path, monkeypatch):
 def test_no_user_config_means_no_mcp_overrides(tmp_path, monkeypatch):
     monkeypatch.setenv("CODEX_HOME", str(tmp_path))
     assert not [a for a in app_server_argv("codex") if a.startswith("mcp_servers")]
+
+
+def test_null_token_usage_is_ignored():
+    t = TurnTracker(model_name="Codex", model_id="x")
+    t.on_notification("thread/tokenUsage/updated", {"tokenUsage": None})
+    assert t.usage == {}
+
+
+def test_malformed_user_config_refuses_to_run(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    (tmp_path / "config.toml").write_text("[mcp_servers.docs\nbroken")
+    with pytest.raises(CliProtocolError, match="config.toml"):
+        app_server_argv("codex")
+
+
+def test_unreadable_user_config_refuses_to_run(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    (tmp_path / "config.toml").mkdir()
+    with pytest.raises(CliProtocolError, match="config.toml"):
+        app_server_argv("codex")

@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Awaitable, Callable
 
 from agno.models.response import ModelResponse
+from agno.utils.log import log_warning
 from pydantic import BaseModel
 
 from agno_cli_models._base import CliModel
@@ -87,20 +88,34 @@ class CodexModel(CliModel):
         rpc = await spawn(app_server_argv(self.codex_bin), clean_env())
         tracker = TurnTracker(model_name=self.name, model_id=self.id)
         try:
-            await rpc.request("initialize", {"clientInfo": {"name": "agno_cli_models", "version": "0.1.0"},
+            from agno_cli_models import __version__
+
+            await rpc.request("initialize", {"clientInfo": {"name": "agno_cli_models", "version": __version__},
                                              "capabilities": {"experimentalApi": True}})
             await rpc.send({"jsonrpc": "2.0", "method": "initialized"})
             cwd = self.resolved_cwd()
+            res = None
             if thread_id:
-                res = await rpc.request("thread/resume", thread_resume_params(thread_id=thread_id, model_id=self.id, system=system, cwd=cwd, sandbox=self.sandbox))
-                pending = self._pending_results(rest)
-                text = continuation_text(pending) if pending else last_user_text(rest)
-            else:
+                try:
+                    res = await rpc.request("thread/resume", thread_resume_params(thread_id=thread_id, model_id=self.id, system=system, cwd=cwd, sandbox=self.sandbox))
+                except CliProtocolError as exc:
+                    # Only an error reply means the server is up and refused the thread
+                    # (for example its session file is gone); anything else is fatal.
+                    if not str(exc).startswith("codex thread/resume failed"):
+                        raise
+                    log_warning(f"codex: could not resume thread {thread_id} ({exc}); starting a new thread from the transcript")
+                else:
+                    pending = self._pending_results(rest)
+                    text = continuation_text(pending) if pending else last_user_text(rest)
+            if res is None:
                 res = await rpc.request("thread/start", thread_start_params(
                     model_id=self.id, system=system, cwd=cwd, sandbox=self.sandbox, builtin_tools=self.builtin_tools,
                     dynamic_tools=[dynamic_tool(f) for f in bridge.functions.values()]))
                 text = transcript_prompt(rest)
-            thread_id = res["thread"]["id"]
+            try:
+                thread_id = res["thread"]["id"]
+            except (KeyError, TypeError) as exc:
+                raise CliProtocolError(f"codex thread response has no thread id: {res!r}"[:500], self.name, self.id) from exc
             tracker.model = res.get("model") or self.id
             marker = session_marker("codex", thread_id)
             turn = await rpc.request("turn/start", turn_start_params(thread_id=thread_id, text=text, effort=self.effort,

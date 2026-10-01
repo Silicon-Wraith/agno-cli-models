@@ -267,3 +267,65 @@ def test_unknown_server_request_gets_jsonrpc_error():
     asyncio.run(model(rpc).aresponse([Message(role="user", content="q")]))
     assert {"jsonrpc": "2.0", "id": 4, "error": {"code": -32601, "message": "not supported by agno-cli-models"}} in rpc.sent
     assert not rpc.replies
+
+
+# ---- final review fixes ----
+
+class StaleRpc(FakeRpc):
+    async def request(self, method, params):
+        if method == "thread/resume":
+            self.requests.append((method, params))
+            raise CliProtocolError("codex thread/resume failed: {'code': -32600, 'message': 'no rollout found'}")
+        return await super().request(method, params)
+
+
+def _stale_msgs():
+    return [Message(role="user", content="q1"), Message(role="assistant", content="a1", provider_data=session_marker("codex", "gone")),
+            Message(role="user", content="q2")]
+
+
+def test_stale_thread_falls_back_to_new_thread():
+    rpc = StaleRpc(script())
+    msgs = _stale_msgs()
+    out = asyncio.run(model(rpc).aresponse(msgs))
+    assert out.content == "hello"
+    assert [r[0] for r in rpc.requests] == ["initialize", "thread/resume", "thread/start", "turn/start"]
+    assert rpc.requests[3][1]["input"][0]["text"].startswith("Conversation so far:")
+    assert find_cli_session(msgs, "codex") == "t1"
+
+
+def test_rate_limit_after_resume_is_not_retried():
+    rl = [note("account/rateLimits/updated", {"rateLimits": {"rateLimitReachedType": "rate_limit_reached"}})]
+    rpc = FakeRpc(script(rl))
+    with pytest.raises(ModelRateLimitError):
+        asyncio.run(model(rpc).aresponse(_stale_msgs()))
+    assert [r[0] for r in rpc.requests] == ["initialize", "thread/resume", "turn/start"]
+
+
+def test_server_exit_during_resume_is_not_retried():
+    class ExitRpc(FakeRpc):
+        async def request(self, method, params):
+            self.requests.append((method, params))
+            if method == "thread/resume":
+                raise CliProtocolError("codex app-server exited")
+            return self.script.get(method, ({}, []))[0]
+
+    rpc = ExitRpc(script())
+    with pytest.raises(CliProtocolError):
+        asyncio.run(model(rpc).aresponse(_stale_msgs()))
+    assert "thread/start" not in [r[0] for r in rpc.requests]
+
+
+def test_thread_response_without_id_is_protocol_error():
+    rpc = FakeRpc({**script(), "thread/start": ({}, [])})
+    with pytest.raises(CliProtocolError):
+        asyncio.run(model(rpc).aresponse([Message(role="user", content="q")]))
+
+
+def test_client_info_version_follows_package(monkeypatch):
+    import agno_cli_models
+
+    monkeypatch.setattr(agno_cli_models, "__version__", "9.9.9")
+    rpc = FakeRpc(script())
+    asyncio.run(model(rpc).aresponse([Message(role="user", content="q")]))
+    assert rpc.requests[0][1]["clientInfo"]["version"] == "9.9.9"

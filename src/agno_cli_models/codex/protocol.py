@@ -20,7 +20,7 @@ from agno.models.response import ModelResponse
 from agno.tools.function import Function
 
 from agno_cli_models._common import config_hash, strict_schema, text_of
-from agno_cli_models.errors import ContextWindowExceededError, ModelProviderError, ModelRateLimitError
+from agno_cli_models.errors import CliProtocolError, ContextWindowExceededError, ModelProviderError, ModelRateLimitError
 
 FIXED_CONFIG = ["-c", 'web_search="disabled"', "-c", "features.apps=false"]
 ALLOWED_SANDBOXES = ("read-only", "workspace-write")
@@ -35,8 +35,13 @@ def _user_mcp_overrides() -> list[str]:
     path = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex") / "config.toml"
     try:
         servers = tomllib.loads(path.read_text()).get("mcp_servers", {})
-    except (OSError, tomllib.TOMLDecodeError):
+    except FileNotFoundError:
         return []
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        # Codex would still load this file, so its servers cannot be disabled by name.
+        raise CliProtocolError(f"cannot read Codex user config {path} to disable its MCP servers: {exc}") from exc
+    if not isinstance(servers, dict):
+        raise CliProtocolError(f"Codex user config {path} has a non-table mcp_servers")
     out: list[str] = []
     for name in servers:
         key = name if re.fullmatch(r"[A-Za-z0-9_-]+", name) else json.dumps(name)
@@ -129,7 +134,7 @@ class TurnTracker:
                 self.final_text = item.get("text", "")
         elif method == "thread/tokenUsage/updated":
             # `last` is per model call, not per turn: sum across the turn's calls.
-            last = params.get("tokenUsage", {}).get("last") or {}
+            last = (params.get("tokenUsage") or {}).get("last") or {}
             for k, v in last.items():
                 if isinstance(v, int):
                     self.usage[k] = self.usage.get(k, 0) + v
