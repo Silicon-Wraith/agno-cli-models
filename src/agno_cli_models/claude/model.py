@@ -6,12 +6,14 @@ from __future__ import annotations
 import asyncio
 import json
 import shutil
+from contextlib import aclosing
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Callable
 
 import claude_agent_sdk as sdk
 from agno.exceptions import AgnoError
 from agno.models.response import ModelResponse
+from agno.utils.log import log_warning
 from pydantic import BaseModel
 
 from agno_cli_models._base import CliModel
@@ -20,10 +22,14 @@ from agno_cli_models._common import find_cli_session, last_user_text, session_ma
 from agno_cli_models.claude.matcher import CallIdMatcher
 from agno_cli_models.claude.options import SERVER, build_options, fingerprint
 from agno_cli_models.claude.translate import check_result, observed_model, rate_limit_error, usage_metrics
-from agno_cli_models.errors import CliProtocolError
+from agno_cli_models.errors import CliProtocolError, ContextWindowExceededError, ModelProviderError, ModelRateLimitError
 from agno_cli_models.versions import check_supported, installed_version
 
 _DONE = object()
+
+
+class _StaleSession(Exception):
+    """Resuming the persisted CLI session failed before the session started."""
 
 
 @dataclass
@@ -66,12 +72,23 @@ class ClaudeCodeModel(CliModel):
     async def _drive(self, messages, response_format, tools, tool_call_limit, run_response, stream: bool) -> AsyncIterator[ModelResponse]:
         cli = self._cli()
         version = self._cli_version(cli)
+        resume = find_cli_session(messages, "claude")
+        try:
+            async for ev in self._attempt(cli, version, messages, response_format, tools, tool_call_limit, stream, resume):
+                yield ev
+        except _StaleSession as stale:
+            log_warning(f"claude: could not resume session {resume} ({stale.__cause__}); "
+                        "starting a new session from the transcript")
+            async for ev in self._attempt(cli, version, messages, response_format, tools, tool_call_limit, stream, None):
+                yield ev
+
+    async def _attempt(self, cli, version, messages, response_format, tools, tool_call_limit, stream: bool,
+                       resume: str | None) -> AsyncIterator[ModelResponse]:
         bridge = ToolBridge(self, tools, messages, tool_call_limit)
         matcher = CallIdMatcher()
         queue: asyncio.Queue = asyncio.Queue()
         system, rest = split_system(messages)
-        resume = find_cli_session(messages, "claude")
-        state: dict[str, Any] = {"session": resume, "result": False}
+        state: dict[str, Any] = {"session": resume, "result": False, "init": False}
 
         async def pre_tool_use(inp: dict, tool_use_id: str | None, ctx: Any) -> dict:
             name = inp.get("tool_name", "")
@@ -141,44 +158,15 @@ class ClaudeCodeModel(CliModel):
 
         task = asyncio.create_task(pump())
         try:
-            while True:
-                item = await queue.get()
-                if item is _DONE:
-                    if not state["result"]:
-                        raise CliProtocolError("claude ended without a result", self.name, self.id)
-                    return
-                if isinstance(item, Exception):
-                    raise item
-                if isinstance(item, ModelResponse):
-                    yield item
-                elif isinstance(item, sdk.StreamEvent):
-                    ev = item.event
-                    if ev.get("type") == "content_block_delta" and ev.get("delta", {}).get("type") == "text_delta":
-                        yield ModelResponse(content=ev["delta"]["text"])
-                elif isinstance(item, sdk.RateLimitEvent):
-                    err = rate_limit_error(item, self.name, self.id)
-                    if err is not None:
-                        raise err
-                elif isinstance(item, sdk.SystemMessage) and item.subtype == "init":
-                    state["session"] = item.data.get("session_id") or state["session"]
-                elif isinstance(item, sdk.ResultMessage):
-                    state["result"] = True
-                    state["session"] = item.session_id or state["session"]
-                    check_result(item, self.name, self.id)
-                    info = {"observed_model": observed_model(item), "cli_version": version, "cli_session_id": state["session"]}
-                    deferred = item.deferred_tool_use
-                    if deferred is not None:
-                        short = deferred.name.removeprefix(f"mcp__{SERVER}__")
-                        for ev in await bridge.pause(deferred.id, short, deferred.input or {}, provider_data=session_marker("claude", state["session"])):
-                            yield ev
-                        text = ""
-                    elif item.structured_output is not None:
-                        text = json.dumps(item.structured_output)
-                    else:
-                        text = item.result or ""
-                    yield self.usage_event(usage_metrics(item), text, info)
-                    if resuming_after_pause or deferred is not None:
-                        return
+            async with aclosing(self._consume(queue, state, bridge, version, resuming_after_pause)) as events:
+                async for ev in events:
+                    yield ev
+        except ModelProviderError as exc:
+            # The SDK reports a missing --resume session only as a failed process with
+            # no detail, so any non-quota failure before the init message counts as one.
+            if resume and not state["init"] and not isinstance(exc, (ModelRateLimitError, ContextWindowExceededError)):
+                raise _StaleSession() from exc
+            raise
         finally:
             if not task.done():
                 task.cancel()
@@ -186,3 +174,45 @@ class ClaudeCodeModel(CliModel):
                     await task
                 except (asyncio.CancelledError, Exception):
                     pass
+
+    async def _consume(self, queue: asyncio.Queue, state: dict, bridge: ToolBridge, version: str | None,
+                       resuming_after_pause: bool) -> AsyncIterator[ModelResponse]:
+        while True:
+            item = await queue.get()
+            if item is _DONE:
+                if not state["result"]:
+                    raise CliProtocolError("claude ended without a result", self.name, self.id)
+                return
+            if isinstance(item, Exception):
+                raise item
+            if isinstance(item, ModelResponse):
+                yield item
+            elif isinstance(item, sdk.StreamEvent):
+                ev = item.event
+                if ev.get("type") == "content_block_delta" and ev.get("delta", {}).get("type") == "text_delta":
+                    yield ModelResponse(content=ev["delta"]["text"])
+            elif isinstance(item, sdk.RateLimitEvent):
+                err = rate_limit_error(item, self.name, self.id)
+                if err is not None:
+                    raise err
+            elif isinstance(item, sdk.SystemMessage) and item.subtype == "init":
+                state["init"] = True
+                state["session"] = item.data.get("session_id") or state["session"]
+            elif isinstance(item, sdk.ResultMessage):
+                state["result"] = True
+                state["session"] = item.session_id or state["session"]
+                check_result(item, self.name, self.id)
+                info = {"observed_model": observed_model(item), "cli_version": version, "cli_session_id": state["session"]}
+                deferred = item.deferred_tool_use
+                if deferred is not None:
+                    short = deferred.name.removeprefix(f"mcp__{SERVER}__")
+                    for ev in await bridge.pause(deferred.id, short, deferred.input or {}, provider_data=session_marker("claude", state["session"])):
+                        yield ev
+                    text = ""
+                elif item.structured_output is not None:
+                    text = json.dumps(item.structured_output)
+                else:
+                    text = item.result or ""
+                yield self.usage_event(usage_metrics(item), text, info)
+                if resuming_after_pause or deferred is not None:
+                    return

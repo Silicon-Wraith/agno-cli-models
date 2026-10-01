@@ -283,3 +283,61 @@ def test_hook_and_mcp_handler_two_step_approval(monkeypatch):
     assert seen["handler"]["content"][0]["text"] == "zapped /x" and seen["handler"]["is_error"] is False
     assert RUNS["n"] == 0
     assert out.content == "done"
+
+
+class SeqQuery:
+    """One scripted item list per call."""
+
+    def __init__(self, *runs):
+        self.runs = list(runs)
+        self.calls = []
+
+    def __call__(self, *, prompt, options):
+        self.calls.append((prompt, options))
+        return FakeQuery(*self.runs[len(self.calls) - 1])(prompt=prompt, options=options)
+
+
+STALE = [Message(role="user", content="q1"),
+         Message(role="assistant", content="a1", provider_data=session_marker("claude", "gone")),
+         Message(role="user", content="q2")]
+NEW_INIT = sdk.SystemMessage(subtype="init", data={"session_id": "sess-new"})
+
+
+def _stale_msgs():
+    return [m.model_copy() for m in STALE]
+
+
+@pytest.mark.parametrize("failure", [
+    pytest.param([sdk.ProcessError("Command failed with exit code 1", exit_code=1)], id="raised"),
+    pytest.param([result(is_error=True, subtype="error_during_execution", result=None, errors=["No conversation found"])], id="error-result"),
+    pytest.param([], id="empty"),
+])
+def test_stale_session_falls_back_to_fresh_session(failure):
+    fake = SeqQuery(failure, [NEW_INIT, result(session_id="sess-new")])
+    msgs = _stale_msgs()
+    out = asyncio.run(model(fake).aresponse(msgs))
+    assert out.content == "hello"
+    assert [c[1].resume for c in fake.calls] == ["gone", None]
+    assert fake.calls[0][0] == "q2" and fake.calls[1][0].startswith("Conversation so far:")
+    assert find_cli_session(msgs, "claude") == "sess-new"
+
+
+def test_failure_after_init_is_not_retried():
+    fake = SeqQuery([INIT, sdk.ProcessError("boom", exit_code=1)], [INIT, result()])
+    with pytest.raises(CliProtocolError):
+        asyncio.run(model(fake).aresponse(_stale_msgs()))
+    assert len(fake.calls) == 1
+
+
+def test_rate_limit_while_resuming_is_not_retried():
+    fake = SeqQuery([result(is_error=True, api_error_status=429)], [INIT, result()])
+    with pytest.raises(ModelRateLimitError):
+        asyncio.run(model(fake).aresponse(_stale_msgs()))
+    assert len(fake.calls) == 1
+
+
+def test_failure_without_resume_is_not_retried():
+    fake = SeqQuery([sdk.ProcessError("boom", exit_code=1)], [INIT, result()])
+    with pytest.raises(CliProtocolError):
+        asyncio.run(model(fake).aresponse([Message(role="user", content="q")]))
+    assert len(fake.calls) == 1
