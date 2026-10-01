@@ -139,6 +139,25 @@ def test_approval_reject_never_runs_tool(make):
     assert all(r.is_resolved() for r in rejected)
 
 
+@pytest.mark.parametrize("make", MODELS)
+def test_arun_stream_yields_content_events(make):
+    from agno.run.agent import RunContentEvent
+
+    async def go():
+        agent = Agent(model=make())
+        chunks = []
+        async for ev in agent.arun("Count from 1 to 5, separated by spaces. Output only the numbers.", stream=True):
+            if isinstance(ev, RunContentEvent) and ev.content:
+                chunks.append(str(ev.content))
+        return agent, chunks
+
+    agent, chunks = asyncio.run(go())
+    text = "".join(chunks)
+    print("STREAM_CHUNKS", len(chunks), json.dumps(text))
+    assert chunks and "5" in text
+    assert agent.model.last_run_info["cli_session_id"]
+
+
 def test_claude_isolation_sees_only_agno_tools(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-should-be-hidden")
     import claude_agent_sdk as sdk

@@ -69,7 +69,7 @@ Shared by both models:
 
 | Field | Default | Meaning |
 | --- | --- | --- |
-| `builtin_tools` | `()` | Claude Code built-in tools to allow, for example `("Read", "Grep")`. Empty means only your Agno tools |
+| `builtin_tools` | `()` | Claude Code built-in tools to allow, for example `("Read", "Grep")`. Listed tools are pre-approved and run without a permission check, so `("Bash",)` means unconditional shell access. Empty means only your Agno tools |
 | `permission_mode` | `None` | Passed to Claude Code. `"bypassPermissions"` is refused with `ValueError` |
 | `max_turns` | `50` | Turn limit inside one call |
 | `cli_path` | `None` | Path to the `claude` binary. Default is the one on `PATH` |
@@ -93,16 +93,18 @@ Claude Code, always on:
 
 Codex, always on:
 - `approval_policy` is `never`, web search disabled, apps disabled, model fallback disabled.
-- `codex app-server` has no `--ignore-user-config`, so the package disables each MCP server defined in `$CODEX_HOME/config.toml` (or `~/.codex/config.toml`) with `-c mcp_servers.<name>.enabled=false`.
+- `codex app-server` has no `--ignore-user-config`, so the package disables each MCP server defined in `$CODEX_HOME/config.toml` (or `~/.codex/config.toml`) with `-c mcp_servers.<name>.enabled=false`. If that file exists but cannot be read or parsed, the call fails with `CliProtocolError` naming the path instead of running without isolation. A missing file is fine. See Known limits for what this does not cover.
 
 Both:
-- Child processes do not see `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `CODEX_API_KEY`, `CLAUDECODE`, or any `CLAUDE_*` variable except `CLAUDE_CONFIG_DIR` and `CLAUDE_CODE_ENTRYPOINT`. For Claude these are blanked (set to empty), because the SDK merges the parent environment and cannot delete keys; for Codex they are removed. A CLI can never fall back to API billing by accident.
+- Child processes do not see `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `CODEX_API_KEY`, `CLAUDECODE`, or any `CLAUDE_*` variable (including `CLAUDE_CODE_OAUTH_TOKEN`) except `CLAUDE_CONFIG_DIR` and `CLAUDE_CODE_ENTRYPOINT`. For Claude these are blanked (set to empty), because the SDK merges the parent environment and cannot delete keys; for Codex they are removed. A CLI can never fall back to API billing or another endpoint by accident.
 - The `--version` probe runs with stdin closed. Each call has a hard wall-clock limit (`timeout_s`).
 - The package never uses `--bare`, `bypassPermissions` or `danger-full-access`, and never reads or passes OAuth tokens.
 
 ## Sessions
 
-The CLI session id (Claude session or Codex thread) is stored in `provider_data` on assistant messages, so Agno's own history persists it. A new agent instance with the same `session_id` resumes the CLI session. Resume needs `add_history_to_context=True`:
+The CLI session id (Claude session or Codex thread) is stored in `provider_data` on assistant messages, so Agno's own history persists it. A new agent instance with the same `session_id` resumes the CLI session. Resume needs `add_history_to_context=True`.
+
+If the stored CLI session no longer exists (its files were cleaned up, or the Agno session moved to another machine), the model logs a warning, starts a new CLI session with the Agno history replayed as a transcript, and stores the new session id. Codex retries only when `thread/resume` gets an error reply. Claude's SDK reports a missing session only as a failed process, so Claude retries when resuming fails before the session starts, unless the failure is a rate limit or context overflow:
 
 ```python
 from agno.db.sqlite import SqliteDb
@@ -143,6 +145,14 @@ done = agent.continue_run(run_response=run, requirements=run.requirements)
 - A rejected tool never runs. The model may retry and pause again, so check `is_paused` after `continue_run`. Confirmed tools run exactly once.
 
 The `continue_run` call above is the Agno 3.0.11 form.
+
+## Streaming
+
+`await agent.arun(..., stream=True)` streams. Sync `agent.run(..., stream=True)` does not: the model's sync `response_stream` runs the whole call and then yields every event at once.
+
+- Claude streams every text delta, including commentary written before a tool call. Codex streams only the deltas of its final answer.
+- In stream mode the stored assistant message is the concatenation of the streamed deltas, so for Claude it can differ from the non-stream answer, which is the CLI's final result text.
+- Structured output is parsed only on the non-stream path.
 
 ## Run info
 
@@ -205,12 +215,12 @@ Tested against Claude Code `2.1.286` and codex-cli `0.155.1`:
 {'claude': ('2.1.286',), 'codex': ('0.155.1',)}
 ```
 
-Any other version emits `UnsupportedCliVersionWarning` (a `UserWarning`) once per model instance when the version is detected. If the version cannot be read, it warns on every call. It never blocks the call.
+Any other version, or a version that cannot be read, emits `UnsupportedCliVersionWarning` (a `UserWarning`) once per model instance. `--version` runs once per instance. It never blocks the call.
 
 ## Known limits
 
 - `codex app-server` is experimental and its protocol may change between Codex releases.
-- Codex isolation covers MCP servers from your user config only. Project-level `.codex` config and plugin MCP servers are not covered.
+- Codex user config is not ignored, because `codex app-server` has no `--ignore-user-config`. Only the MCP servers in your user `config.toml` are neutralised. The rest of that config still applies, for example `notify`, `model_provider` and `model_providers`, `shell_environment_policy`, `[plugins]`, and `~/.codex/AGENTS.md`. Project-level `.codex` config and plugin MCP servers are not covered either.
 - Every Codex call leaves a session file under `$CODEX_HOME/sessions` containing the prompt.
 - Claude's SDK bundles its own CLI, but this package uses the `claude` on `PATH` unless `cli_path` is set, so the version you tested is the version you run.
 - Codex needs the `/usr/bin/bwrap` AppArmor profile on Ubuntu 24.04 for its sandbox.
