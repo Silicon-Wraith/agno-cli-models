@@ -17,7 +17,8 @@ from agno.models.base import Model
 from agno.models.message import Message
 from agno.models.response import ModelResponse, ModelResponseEvent
 from agno.run.requirement import RunRequirement
-from pydantic import BaseModel
+from agno.utils.log import log_warning
+from pydantic import BaseModel, ValidationError
 
 from agno_cli_models._common import run_sync, session_marker
 from agno_cli_models.errors import CliTimeoutError
@@ -123,8 +124,10 @@ class CliModel(Model):
         if isinstance(response_format, type) and issubclass(response_format, BaseModel) and out.content:
             try:
                 out.parsed = response_format.model_validate_json(out.content)
-            except Exception:
-                pass
+            except (ValidationError, ValueError) as exc:
+                msg = str(exc).splitlines()[0][:200] if str(exc) else type(exc).__name__
+                log_warning(f"{self.CLI}: structured output did not match {response_format.__name__}: {msg}")
+                self.last_run_info["parse_error"] = msg
         return out
 
     async def aresponse_stream(  # type: ignore[override]
@@ -140,7 +143,7 @@ class CliModel(Model):
                 if not streamed and final:
                     streamed = final
                     yield ModelResponse(content=final)
-                self._finish(ev, messages, streamed or final, run_response)
+                self._finish(ev, messages, (streamed or final) if final else "", run_response)
                 continue
             if ev.event == ModelResponseEvent.assistant_response.value and ev.content:
                 streamed += ev.content

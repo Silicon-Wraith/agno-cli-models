@@ -4,7 +4,8 @@ from dataclasses import dataclass
 import pytest
 from agno.metrics import MessageMetrics
 from agno.models.message import Message
-from agno.models.response import ModelResponse
+from agno.metrics import RunMetrics
+from agno.models.response import ModelResponse, ModelResponseEvent, ToolExecution
 from pydantic import BaseModel
 
 from agno_cli_models._base import CliModel
@@ -92,3 +93,71 @@ def test_resolved_cwd_defaults_to_private_empty_dir(tmp_path):
     assert Scripted(cwd=str(tmp_path)).resolved_cwd() == str(tmp_path)
     default = Scripted().resolved_cwd()
     assert "agno-cli-models" in default
+
+
+@dataclass
+class Pausing(Scripted):
+    async def _drive(self, messages, response_format, tools, tool_call_limit, run_response, stream):
+        yield ModelResponse(content="pre")
+        yield ModelResponse(event=ModelResponseEvent.tool_call_paused.value, tool_executions=[ToolExecution(tool_name="t")])
+        yield self.usage_event(MessageMetrics(), "", {"observed_model": "m", "cli_version": "1", "cli_session_id": "s"})
+
+
+def test_stream_with_empty_final_appends_no_assistant_message():
+    msgs = [Message(role="user", content="hi")]
+
+    async def collect():
+        return [e async for e in Pausing().aresponse_stream(msgs)]
+
+    asyncio.run(collect())
+    assert [m.role for m in msgs] == ["user"]
+
+
+def test_pause_adds_requirement_in_both_paths():
+    run = FakeRun()
+    run.requirements = None
+    out = asyncio.run(Pausing().aresponse([Message(role="user", content="hi")], run_response=run))
+    assert len(run.requirements) == 1 and out.tool_executions[0].tool_name == "t"
+    run2 = FakeRun()
+    run2.requirements = None
+
+    async def collect():
+        return [e async for e in Pausing().aresponse_stream([Message(role="user", content="hi")], run_response=run2)]
+
+    asyncio.run(collect())
+    assert len(run2.requirements) == 1
+
+
+def test_metrics_accumulate_into_run_metrics():
+    run = FakeRun()
+    run.metrics = RunMetrics()
+    asyncio.run(Scripted().aresponse([Message(role="user", content="hi")], run_response=run))
+    assert run.metrics.input_tokens == 10 and run.metrics.output_tokens == 2
+
+
+def test_last_run_info_contents():
+    m = Scripted()
+    asyncio.run(m.aresponse([Message(role="user", content="hi")]))
+    assert m.last_run_info == {
+        "observed_model": "m-1", "cli_version": "2.1.286", "cli_session_id": "sess-1",
+        "cli": "claude", "config_fingerprint": "f" * 64,
+    }
+
+
+def test_parse_failure_is_recorded_not_raised(monkeypatch):
+    import agno_cli_models._base as base
+
+    warnings = []
+    monkeypatch.setattr(base, "log_warning", warnings.append)
+    m = Scripted(final="not json")
+    out = asyncio.run(m.aresponse([Message(role="user", content="q")], response_format=City))
+    assert out.parsed is None and out.content == "not json"
+    assert warnings and m.last_run_info["parse_error"]
+
+
+def test_stream_times_out():
+    async def collect():
+        return [e async for e in Scripted(delay=5, timeout_s=0.2).aresponse_stream([Message(role="user", content="hi")])]
+
+    with pytest.raises(CliTimeoutError):
+        asyncio.run(collect())
