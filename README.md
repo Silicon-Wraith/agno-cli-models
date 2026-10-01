@@ -96,8 +96,8 @@ Codex, always on:
 - `codex app-server` has no `--ignore-user-config`, so the package disables each MCP server defined in `$CODEX_HOME/config.toml` (or `~/.codex/config.toml`) with `-c mcp_servers.<name>.enabled=false`.
 
 Both:
-- Child processes never see `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `CODEX_API_KEY`, `CLAUDECODE`, or any `CLAUDE_*` variable except `CLAUDE_CONFIG_DIR` and `CLAUDE_CODE_ENTRYPOINT`. A CLI can never fall back to API billing by accident.
-- Subprocess stdin is empty and every call has a wall-clock timeout.
+- Child processes do not see `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `CODEX_API_KEY`, `CLAUDECODE`, or any `CLAUDE_*` variable except `CLAUDE_CONFIG_DIR` and `CLAUDE_CODE_ENTRYPOINT`. For Claude these are blanked (set to empty), because the SDK merges the parent environment and cannot delete keys; for Codex they are removed. A CLI can never fall back to API billing by accident.
+- The `--version` probe runs with stdin closed. Each call has a hard wall-clock limit (`timeout_s`).
 - The package never uses `--bare`, `bypassPermissions` or `danger-full-access`, and never reads or passes OAuth tokens.
 
 ## Sessions
@@ -155,6 +155,7 @@ After a run, `model.last_run_info` holds details of the last call, and the same 
 | `cli_session_id` | Claude session id or Codex thread id |
 | `config_fingerprint` | SHA-256 of the isolation and permission settings in force |
 | `cli` | `"claude"` or `"codex"` |
+| `parse_error` | Optional. First line of the validation error when structured output did not match `output_schema` (non-stream path) |
 
 ```python
 agent = Agent(model=ClaudeCodeModel(), tools=[get_secret])
@@ -204,7 +205,7 @@ Tested against Claude Code `2.1.286` and codex-cli `0.155.1`:
 {'claude': ('2.1.286',), 'codex': ('0.155.1',)}
 ```
 
-Any other version emits `UnsupportedCliVersionWarning` (a `UserWarning`) once per model instance. It never blocks the call.
+Any other version emits `UnsupportedCliVersionWarning` (a `UserWarning`) once per model instance when the version is detected. If the version cannot be read, it warns on every call. It never blocks the call.
 
 ## Known limits
 
