@@ -341,3 +341,15 @@ def test_failure_without_resume_is_not_retried():
     with pytest.raises(CliProtocolError):
         asyncio.run(model(fake).aresponse([Message(role="user", content="q")]))
     assert len(fake.calls) == 1
+
+
+def test_unreadable_version_is_probed_and_warned_once(monkeypatch):
+    from agno_cli_models.versions import UnsupportedCliVersionWarning
+
+    probes = []
+    monkeypatch.setattr("agno_cli_models.claude.model.installed_version", lambda path: probes.append(path))
+    m = model(SeqQuery([INIT, result()], [INIT, result()]))
+    with pytest.warns(UnsupportedCliVersionWarning):
+        asyncio.run(m.aresponse([Message(role="user", content="q")]))
+    asyncio.run(m.aresponse([Message(role="user", content="q")]))
+    assert len(probes) == 1 and m.last_run_info["cli_version"] is None

@@ -44,6 +44,7 @@ class ClaudeCodeModel(CliModel):
     cli_path: str | None = None
     query_fn: Callable | None = field(default=None, repr=False)
     _version: str | None = field(default=None, repr=False)
+    _version_checked: bool = field(default=False, repr=False)
     CLI = "claude"
 
     def config_fingerprint(self) -> str:
@@ -56,7 +57,8 @@ class ClaudeCodeModel(CliModel):
         return path
 
     def _cli_version(self, path: str) -> str | None:
-        if self._version is None:
+        if not self._version_checked:
+            self._version_checked = True
             self._version = installed_version(path)
             check_supported("claude", self._version)
         return self._version

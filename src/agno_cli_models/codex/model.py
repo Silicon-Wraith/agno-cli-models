@@ -51,13 +51,15 @@ class CodexModel(CliModel):
     codex_bin: str = "codex"
     spawn_fn: Callable[[list[str], dict], Awaitable[Any]] | None = field(default=None, repr=False)
     _version: str | None = field(default=None, repr=False)
+    _version_checked: bool = field(default=False, repr=False)
     CLI = "codex"
 
     def config_fingerprint(self) -> str:
         return fingerprint(self.sandbox, self.builtin_tools)
 
     def _cli_version(self) -> str | None:
-        if self._version is None:
+        if not self._version_checked:
+            self._version_checked = True
             self._version = installed_version(self.codex_bin)
             check_supported("codex", self._version)
         return self._version

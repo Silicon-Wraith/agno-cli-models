@@ -329,3 +329,18 @@ def test_client_info_version_follows_package(monkeypatch):
     rpc = FakeRpc(script())
     asyncio.run(model(rpc).aresponse([Message(role="user", content="q")]))
     assert rpc.requests[0][1]["clientInfo"]["version"] == "9.9.9"
+
+
+def test_unreadable_version_is_probed_and_warned_once(monkeypatch):
+    from agno_cli_models.versions import UnsupportedCliVersionWarning
+
+    probes = []
+    monkeypatch.setattr("agno_cli_models.codex.model.installed_version", lambda b: probes.append(b))
+    rpc = FakeRpc(script())
+    m = model(rpc)
+    with pytest.warns(UnsupportedCliVersionWarning):
+        asyncio.run(m.aresponse([Message(role="user", content="q")]))
+    rpc.inbox = asyncio.Queue()
+    rpc.script = script()
+    asyncio.run(m.aresponse([Message(role="user", content="q")]))
+    assert len(probes) == 1 and m.last_run_info["cli_version"] is None
