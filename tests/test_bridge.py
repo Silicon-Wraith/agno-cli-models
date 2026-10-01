@@ -6,7 +6,7 @@ from agno.models.response import ModelResponseEvent
 from agno.tools import tool
 from agno.tools.function import Function
 
-from agno_cli_models._base import CliModel
+from agno_cli_models import CliModel
 from agno_cli_models._bridge import ToolBridge
 
 
