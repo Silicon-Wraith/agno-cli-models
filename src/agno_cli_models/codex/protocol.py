@@ -56,7 +56,7 @@ def app_server_argv(binary: str) -> list[str]:
 def fingerprint(sandbox: str, builtin_tools: bool) -> str:
     return config_hash({"cli": "codex", "config": FIXED_CONFIG, "approval_policy": "never",
                         "allow_model_fallback": False, "sandbox": sandbox, "builtin_tools": builtin_tools,
-                        "env": "clean_env/v1", "schema": "strict", "user_mcp_servers": "disabled"})
+                        "env": "clean_env/v2", "schema": "strict", "user_mcp_servers": "disabled"})
 
 
 def _check_sandbox(sandbox: str) -> None:

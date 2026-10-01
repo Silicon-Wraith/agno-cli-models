@@ -17,7 +17,8 @@ PARENT = {
 
 
 def test_is_removed():
-    for key in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "CODEX_API_KEY", "CLAUDECODE", "CLAUDE_CODE_SESSION_ID", "CLAUDE_EFFORT"):
+    for key in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "CODEX_API_KEY", "CLAUDECODE", "CLAUDE_CODE_SESSION_ID", "CLAUDE_EFFORT",
+                "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "OPENAI_BASE_URL", "CLAUDE_CODE_OAUTH_TOKEN"):
         assert is_removed(key), key
     for key in ("HOME", "PATH", "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_ENTRYPOINT"):
         assert not is_removed(key), key

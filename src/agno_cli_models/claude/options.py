@@ -17,7 +17,7 @@ from agno_cli_models._env import blanking_overrides
 SERVER = "agno"
 ISOLATION_SETTINGS = {"disableClaudeAiConnectors": True, "autoMemoryEnabled": False}
 REFUSED_PERMISSION_MODES = ("bypassPermissions",)
-ENV_POLICY = "blank-api-keys-and-claude-vars/v1"
+ENV_POLICY = "blank-api-keys-and-claude-vars/v2"
 
 
 def fingerprint(builtin_tools: Sequence[str], permission_mode: str | None) -> str:
