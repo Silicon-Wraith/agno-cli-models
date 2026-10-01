@@ -71,6 +71,12 @@ def model(rpc, **over):
 
 
 @pytest.fixture(autouse=True)
+def isolated_codex_home(tmp_path, monkeypatch):
+    """Keep unit tests independent of the developer's real ~/.codex/config.toml."""
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+
+
+@pytest.fixture(autouse=True)
 def pinned_version(monkeypatch):
     monkeypatch.setattr("agno_cli_models.codex.model.installed_version", lambda b: "0.155.1")
 
