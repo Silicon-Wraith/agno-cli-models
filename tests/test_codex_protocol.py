@@ -109,3 +109,16 @@ def test_rate_limit_snapshot_reached_raises():
     with pytest.raises(ModelRateLimitError):
         tracker().on_notification("account/rateLimits/updated", {"rateLimits": {"rateLimitReachedType": "rate_limit_reached"}})
     assert tracker().on_notification("account/rateLimits/updated", {"rateLimits": {"rateLimitReachedType": None}}) == []
+
+
+def test_user_mcp_servers_are_disabled(tmp_path, monkeypatch):
+    (tmp_path / "config.toml").write_text('[mcp_servers.docs-rag]\ncommand = "x"\n[mcp_servers."odd name"]\nurl = "http://y"\n')
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    argv = app_server_argv("codex")
+    assert "mcp_servers.docs-rag.enabled=false" in argv
+    assert 'mcp_servers."odd name".enabled=false' in argv
+
+
+def test_no_user_config_means_no_mcp_overrides(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    assert not [a for a in app_server_argv("codex") if a.startswith("mcp_servers")]

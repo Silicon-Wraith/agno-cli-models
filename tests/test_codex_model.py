@@ -7,6 +7,7 @@ from agno.tools.function import Function
 
 from agno_cli_models._common import find_cli_session, session_marker
 from agno_cli_models.codex.model import CodexModel
+from agno_cli_models.codex.protocol import PAUSE_TEXT
 from agno_cli_models.codex.rpc import DONE
 from agno_cli_models.errors import CliProtocolError, ModelRateLimitError
 
@@ -195,3 +196,74 @@ def test_other_server_requests_are_declined():
 
 def test_fingerprint_follows_sandbox():
     assert CodexModel(sandbox="read-only").config_fingerprint() != CodexModel(sandbox="workspace-write").config_fingerprint()
+
+
+# ---- fix round 1 ----
+
+def approval_call(i, cid):
+    return {"jsonrpc": "2.0", "id": i, "method": "item/tool/call", "params": {"callId": cid, "tool": "wipe", "arguments": {"path": "/x"}}}
+
+
+class _Run:
+    session_id, model_provider_data, metrics, requirements = "a", None, None, None
+
+
+def test_pause_race_completed_turn_gives_empty_content_and_no_extra_message():
+    rpc = FakeRpc(script([approval_call(8, "c9")]), after_reply={8: FINAL})
+    rpc.script["turn/interrupt"] = ({}, [])
+    wipe.process_entrypoint()
+    run = _Run()
+    msgs = [Message(role="user", content="delete /x")]
+    out = asyncio.run(model(rpc).aresponse(msgs, tools=[wipe], run_response=run))
+    assert run.requirements
+    assert not out.content
+    assert [m.role for m in msgs] == ["user", "assistant"]
+
+
+def test_interrupt_error_is_tolerated_once_paused():
+    class Rpc2(FakeRpc):
+        async def request(self, method, params):
+            if method == "turn/interrupt":
+                self.requests.append((method, params))
+                raise CliProtocolError("no active turn", "Codex", "x")
+            return await super().request(method, params)
+
+    rpc = Rpc2(script([approval_call(8, "c9")]), after_reply={8: FINAL})
+    wipe.process_entrypoint()
+    run = _Run()
+    asyncio.run(model(rpc).aresponse([Message(role="user", content="d")], tools=[wipe], run_response=run))
+    assert run.requirements
+
+
+def test_two_approvals_one_interrupt_and_later_tools_not_run():
+    interrupted = [note("turn/completed", {"turn": {"id": "u1", "status": "interrupted"}})]
+    add_call = {"jsonrpc": "2.0", "id": 10, "method": "item/tool/call", "params": {"callId": "c3", "tool": "add", "arguments": {"a": 1, "b": 2}}}
+    rpc = FakeRpc({**script([approval_call(8, "c9"), approval_call(9, "c10"), add_call]), "turn/interrupt": ({}, interrupted)})
+    wipe.process_entrypoint()
+    fn = Function.from_callable(add)
+    fn.process_entrypoint()
+    msgs = [Message(role="user", content="d")]
+    asyncio.run(model(rpc).aresponse(msgs, tools=[wipe, fn], run_response=_Run()))
+    assert [r[0] for r in rpc.requests].count("turn/interrupt") == 1
+    assert rpc.replies[-1] == (10, {"contentItems": [{"type": "inputText", "text": PAUSE_TEXT}], "success": False})
+    assert not any(m.role == "tool" and m.tool_call_id == "c3" for m in msgs)
+
+
+@pytest.mark.parametrize("method,expected", [
+    ("item/commandExecution/requestApproval", {"decision": "decline"}),
+    ("item/fileChange/requestApproval", {"decision": "decline"}),
+    ("applyPatchApproval", {"decision": "denied"}),
+    ("execCommandApproval", {"decision": "denied"}),
+    ("mcpServer/elicitation/request", {"action": "decline"}),
+])
+def test_server_request_replies_follow_schema(method, expected):
+    rpc = FakeRpc(script([{"jsonrpc": "2.0", "id": 3, "method": method, "params": None}] + FINAL))
+    asyncio.run(model(rpc).aresponse([Message(role="user", content="q")]))
+    assert rpc.replies[0] == (3, expected)
+
+
+def test_unknown_server_request_gets_jsonrpc_error():
+    rpc = FakeRpc(script([{"jsonrpc": "2.0", "id": 4, "method": "weird/thing", "params": {}}] + FINAL))
+    asyncio.run(model(rpc).aresponse([Message(role="user", content="q")]))
+    assert {"jsonrpc": "2.0", "id": 4, "error": {"code": -32601, "message": "not supported by agno-cli-models"}} in rpc.sent
+    assert not rpc.replies

@@ -30,6 +30,15 @@ from agno_cli_models.errors import CliProtocolError
 from agno_cli_models.versions import check_supported, installed_version
 
 
+_DECLINES = {
+    "item/commandExecution/requestApproval": {"decision": "decline"},
+    "item/fileChange/requestApproval": {"decision": "decline"},
+    "applyPatchApproval": {"decision": "denied"},
+    "execCommandApproval": {"decision": "denied"},
+    "mcpServer/elicitation/request": {"action": "decline"},
+}
+
+
 @dataclass
 class CodexModel(CliModel):
     id: str = "gpt-5.6-sol"
@@ -98,21 +107,30 @@ class CodexModel(CliModel):
                                                                     builtin_tools=self.builtin_tools, output_schema=schema))
             turn_id = turn.get("turn", {}).get("id")
 
+            paused = False
             while not tracker.done:
                 msg = await rpc.inbox.get()
                 if msg is DONE:
                     raise CliProtocolError("codex app-server exited mid-turn", self.name, self.id)
-                method, params = msg.get("method"), msg.get("params", {})
+                method, params = msg.get("method"), msg.get("params") or {}
                 if method == "item/tool/call" and "id" in msg:
                     name, call_id, args = params.get("tool"), params.get("callId"), params.get("arguments") or {}
                     done = bridge.precomputed(call_id)
+                    if done is None and paused and not bridge.needs_pause(name):
+                        await rpc.reply(msg["id"], {"contentItems": [{"type": "inputText", "text": PAUSE_TEXT}], "success": False})
+                        continue
                     if done is not None:
                         text_out, ok = done
                     elif bridge.needs_pause(name):
                         await rpc.reply(msg["id"], {"contentItems": [{"type": "inputText", "text": PAUSE_TEXT}], "success": False})
                         for ev in await bridge.pause(call_id, name, args, provider_data=marker):
                             yield ev
-                        await rpc.request("turn/interrupt", {"threadId": thread_id, "turnId": turn_id})
+                        if not paused:
+                            paused = True
+                            try:
+                                await rpc.request("turn/interrupt", {"threadId": thread_id, "turnId": params.get("turnId") or turn_id})
+                            except CliProtocolError:
+                                pass  # the turn may already be over; the pause is recorded either way
                         continue
                     else:
                         events, text_out, ok = await bridge.run(call_id, name, args, provider_data=marker)
@@ -120,7 +138,11 @@ class CodexModel(CliModel):
                             yield ev
                     await rpc.reply(msg["id"], {"contentItems": [{"type": "inputText", "text": text_out}], "success": ok})
                 elif "id" in msg and method:
-                    await rpc.reply(msg["id"], {"decision": "decline"})
+                    if method in _DECLINES:
+                        await rpc.reply(msg["id"], _DECLINES[method])
+                    else:
+                        await rpc.send({"jsonrpc": "2.0", "id": msg["id"],
+                                        "error": {"code": -32601, "message": "not supported by agno-cli-models"}})
                 else:
                     for ev in tracker.on_notification(method, params):
                         yield ev
@@ -132,6 +154,6 @@ class CodexModel(CliModel):
                 except json.JSONDecodeError:
                     pass
             info = {"observed_model": tracker.model, "cli_version": version, "cli_session_id": thread_id}
-            yield self.usage_event(tracker.metrics(), "" if tracker.interrupted else final, info)
+            yield self.usage_event(tracker.metrics(), "" if (paused or tracker.interrupted) else final, info)
         finally:
             await rpc.close()

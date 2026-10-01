@@ -6,7 +6,12 @@ codex-cli 0.155.1.
 
 from __future__ import annotations
 
+import json
+import os
+import re
+import tomllib
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from agno.metrics import MessageMetrics
@@ -24,14 +29,29 @@ PAUSE_TEXT = ("This tool call needs a human decision and has not run. Stop now a
 _RATE_INFOS = ("usageLimitExceeded", "rateLimitExceeded")
 
 
+def _user_mcp_overrides() -> list[str]:
+    """`codex app-server` has no --ignore-user-config, and `-c mcp_servers={}` does not clear
+    servers from the user's config.toml, so disable each one by name."""
+    path = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex") / "config.toml"
+    try:
+        servers = tomllib.loads(path.read_text()).get("mcp_servers", {})
+    except (OSError, tomllib.TOMLDecodeError):
+        return []
+    out: list[str] = []
+    for name in servers:
+        key = name if re.fullmatch(r"[A-Za-z0-9_-]+", name) else json.dumps(name)
+        out += ["-c", f"mcp_servers.{key}.enabled=false"]
+    return out
+
+
 def app_server_argv(binary: str) -> list[str]:
-    return [binary, "app-server", *FIXED_CONFIG]
+    return [binary, "app-server", *FIXED_CONFIG, *_user_mcp_overrides()]
 
 
 def fingerprint(sandbox: str, builtin_tools: bool) -> str:
     return config_hash({"cli": "codex", "config": FIXED_CONFIG, "approval_policy": "never",
                         "allow_model_fallback": False, "sandbox": sandbox, "builtin_tools": builtin_tools,
-                        "env": "clean_env/v1", "schema": "strict"})
+                        "env": "clean_env/v1", "schema": "strict", "user_mcp_servers": "disabled"})
 
 
 def _check_sandbox(sandbox: str) -> None:
