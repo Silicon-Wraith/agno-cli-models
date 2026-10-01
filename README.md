@@ -93,7 +93,15 @@ Claude Code, always on:
 
 Codex, always on:
 - `approval_policy` is `never`, web search disabled, apps disabled, model fallback disabled.
-- `codex app-server` has no `--ignore-user-config`, so the package disables each MCP server defined in `$CODEX_HOME/config.toml` (or `~/.codex/config.toml`) with `-c mcp_servers.<name>.enabled=false`. If that file exists but cannot be read or parsed, the call fails with `CliProtocolError` naming the path instead of running without isolation. A missing file is fine. See Known limits for what this does not cover.
+- `codex app-server` has no `--ignore-user-config`, so the package disables each MCP server defined in `$CODEX_HOME/config.toml` (or `~/.codex/config.toml`) with `-c mcp_servers.<name>.enabled=false`. If that file exists but cannot be read or parsed, the call fails with `CliProtocolError` naming the path instead of running without isolation. A missing file is fine.
+- Skills are off. The skills prompt and Codex's bundled skills are disabled, and every `SKILL.md` under `$CODEX_HOME/skills` is disabled by path.
+- Plugins, hooks, memories, image generation, browser and computer use, goals, tool suggestions, the sleep tool, shell snapshots and `request_user_input` are disabled. Personality is `none`.
+- The `/root` multi-agent prompt is blanked. The model can still start sub-agents; see Known limits.
+- What the model still sees besides your prompt:
+  - the sandbox and approval policy
+  - the date and timezone
+  - Codex's `<multi_agent_mode>` line, which tells it not to start sub-agents unless asked
+- See Known limits for what this does not cover. Every `-c` key is checked against the installed Codex with `--strict-config` in the unit tests.
 
 Both:
 - Child processes do not see `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `CODEX_API_KEY`, `CLAUDECODE`, or any `CLAUDE_*` variable (including `CLAUDE_CODE_OAUTH_TOKEN`) except `CLAUDE_CONFIG_DIR` and `CLAUDE_CODE_ENTRYPOINT`. For Claude these are blanked (set to empty), because the SDK merges the parent environment and cannot delete keys; for Codex they are removed. A CLI can never fall back to API billing or another endpoint by accident.
@@ -220,7 +228,12 @@ Any other version, or a version that cannot be read, emits `UnsupportedCliVersio
 ## Known limits
 
 - `codex app-server` is experimental and its protocol may change between Codex releases.
-- Codex user config is not ignored, because `codex app-server` has no `--ignore-user-config`. Only the MCP servers in your user `config.toml` are neutralised. The rest of that config still applies, for example `notify`, `model_provider` and `model_providers`, `shell_environment_policy`, `[plugins]`, and `~/.codex/AGENTS.md`. Project-level `.codex` config and plugin MCP servers are not covered either.
+- Codex user config is not ignored, because `codex app-server` has no `--ignore-user-config`. The package switches off what it can, listed under Isolation. The rest of that config still applies, for example `notify`, `model_provider` and `model_providers`, `shell_environment_policy`, and `~/.codex/AGENTS.md`. Project-level `.codex` config and project skills are not covered either.
+- Codex still offers the model some tools that no config setting removes in codex-cli 0.155.1:
+  - **Collaboration tools** (`spawn_agent`, `wait_agent`, `followup_task`, `send_message`, `interrupt_agent`, `list_agents`). The model catalog enables multi-agent v2 for `gpt-5.6-sol`, and no config key stops a spawn. A spawned sub-agent runs in the same sandbox and gets Codex's own sub-agent prompt. Only the kept `<multi_agent_mode>` instruction stands between the model and a spawn, so a call can include work by more than one agent. Whether a sub-agent can call your Agno tools has not been tested.
+  - **`skills__list` and `skills__read`.** Every skill they could reach is disabled.
+  - **`functions.exec` and `functions.wait`.** These are not a leak: in this model's code mode, every tool call goes through `exec`, including your Agno tools.
+- The tool lists above are what the model reports; Codex does not record the tools it offers. The details are in `reports/2026-10-01-codex-isolation-findings.md`.
 - Every Codex call leaves a session file under `$CODEX_HOME/sessions` containing the prompt.
 - Claude's SDK bundles its own CLI, but this package uses the `claude` on `PATH` unless `cli_path` is set, so the version you tested is the version you run.
 - Codex needs the `/usr/bin/bwrap` AppArmor profile on Ubuntu 24.04 for its sandbox.

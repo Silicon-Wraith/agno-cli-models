@@ -214,3 +214,30 @@ def test_codex_app_server_starts_no_mcp_servers():
         assert not server.get("runtimeStatus"), f"MCP server has runtime status: {server}"
         assert not server.get("serverInfo"), f"MCP server connected: {server}"
         assert not server.get("tools"), f"MCP server started with tools: {server}"
+
+
+def test_codex_call_carries_no_user_setup():
+    """The rollout records every context item Codex sent; none may come from the user's skills,
+    plugins or the multi-agent prompts, and the personality is pinned."""
+    import glob
+    import os
+    from pathlib import Path
+
+    model = codex()
+    Agent(model=model).run("Say OK.")
+    thread_id = model.last_run_info["cli_session_id"]
+    home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+    [path] = glob.glob(str(home / "sessions" / "*" / "*" / "*" / f"rollout-*-{thread_id}.jsonl"))
+    texts, contexts = [], []
+    for line in Path(path).read_text().splitlines():
+        record = json.loads(line)
+        payload = record.get("payload", {})
+        if record.get("type") == "turn_context":
+            contexts.append(payload)
+        elif record.get("type") == "response_item" and payload.get("role") in ("developer", "user"):
+            texts += [c.get("text", "") for c in payload.get("content", [])]
+    joined = "\n".join(texts)
+    for marker in ("<skills_instructions>", "<plugins_instructions>", "<apps_instructions>", "You are `/root`"):
+        assert marker not in joined, marker
+    assert "<multi_agent_mode>" in joined  # Codex's own "do not spawn unless asked" is kept on purpose
+    assert contexts and all(c.get("personality") == "none" for c in contexts)
