@@ -8,7 +8,7 @@ from agno.metrics import RunMetrics
 from agno.models.response import ModelResponse, ModelResponseEvent, ToolExecution
 from pydantic import BaseModel
 
-from agno_cli_models._base import CliModel
+from agno_cli_models import CliModel
 from agno_cli_models._common import find_cli_session
 from agno_cli_models.errors import CliTimeoutError
 

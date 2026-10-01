@@ -8,7 +8,7 @@ import warnings
 
 from agno_cli_models._env import clean_env
 
-SUPPORTED: dict[str, tuple[str, ...]] = {"claude": ("2.1.286",), "codex": ("0.155.1",)}
+SUPPORTED: dict[str, tuple[str, ...]] = {"claude": ("2.1.286", "2.1.287"), "codex": ("0.155.1",)}
 _VERSION = re.compile(r"\b(\d+\.\d+\.\d+)\b")
 
 

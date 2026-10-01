@@ -56,7 +56,7 @@ Agent(model=CodexModel(), output_schema=City).run("Capital of Norway?")
 
 ## Parameters
 
-Shared by both models:
+Both models subclass `CliModel`, exported from the package root for type checks and `isinstance`. Shared by both models:
 
 | Field | Default | Meaning |
 | --- | --- | --- |
@@ -207,12 +207,12 @@ Because rate limits use Agno's classes, Agno's `FallbackConfig(on_rate_limit=[..
 
 ## Supported CLI versions
 
-Tested against Claude Code `2.1.286` and codex-cli `0.155.1`:
+Tested against Claude Code `2.1.286` and `2.1.287`, and codex-cli `0.155.1`:
 
 ```python
 >>> import agno_cli_models as m
 >>> m.SUPPORTED
-{'claude': ('2.1.286',), 'codex': ('0.155.1',)}
+{'claude': ('2.1.286', '2.1.287'), 'codex': ('0.155.1',)}
 ```
 
 Any other version, or a version that cannot be read, emits `UnsupportedCliVersionWarning` (a `UserWarning`) once per model instance. `--version` runs once per instance. It never blocks the call.

@@ -16,6 +16,7 @@ def test_supported_versions_pass_silently():
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         assert check_supported("claude", "2.1.286") is True
+        assert check_supported("claude", "2.1.287") is True
         assert check_supported("codex", "0.155.1") is True
 
 
@@ -31,3 +32,13 @@ def test_installed_version_reads_the_binary(tmp_path):
     fake.chmod(0o755)
     assert installed_version(str(fake)) == "9.8.7"
     assert installed_version(str(tmp_path / "missing")) is None
+
+
+def test_cli_model_is_exported_from_the_package_root():
+    import agno_cli_models
+    from agno_cli_models._base import CliModel
+
+    assert agno_cli_models.CliModel is CliModel
+    assert "CliModel" in agno_cli_models.__all__
+    assert issubclass(agno_cli_models.ClaudeCodeModel, CliModel)
+    assert issubclass(agno_cli_models.CodexModel, CliModel)
