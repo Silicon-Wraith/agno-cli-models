@@ -76,13 +76,15 @@ class ClaudeCodeModel(CliModel):
         version = self._cli_version(cli)
         resume = find_cli_session(messages, "claude")
         try:
-            async for ev in self._attempt(cli, version, messages, response_format, tools, tool_call_limit, stream, resume):
-                yield ev
+            async with aclosing(self._attempt(cli, version, messages, response_format, tools, tool_call_limit, stream, resume)) as events:
+                async for ev in events:
+                    yield ev
         except _StaleSession as stale:
             log_warning(f"claude: could not resume session {resume} ({stale.__cause__}); "
                         "starting a new session from the transcript")
-            async for ev in self._attempt(cli, version, messages, response_format, tools, tool_call_limit, stream, None):
-                yield ev
+            async with aclosing(self._attempt(cli, version, messages, response_format, tools, tool_call_limit, stream, None)) as events:
+                async for ev in events:
+                    yield ev
 
     async def _attempt(self, cli, version, messages, response_format, tools, tool_call_limit, stream: bool,
                        resume: str | None) -> AsyncIterator[ModelResponse]:
