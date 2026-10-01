@@ -95,3 +95,18 @@ def test_run_sync_inside_running_loop():
         return run_sync(_double(3))
 
     assert asyncio.run(outer()) == 6
+
+
+def test_strict_schema_keeps_properties_named_like_schema_keywords():
+    from pydantic import BaseModel
+
+    class Setting(BaseModel):
+        default: str
+        other: str = "x"
+
+    schema = Setting.model_json_schema()
+    schema["$schema"] = "https://json-schema.org/draft/2020-12/schema"
+    out = strict_schema(schema)
+    assert set(out["properties"]) == {"default", "other"}
+    assert set(out["required"]) == {"default", "other"}
+    assert "$schema" not in out and "default" not in out["properties"]["other"]

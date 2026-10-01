@@ -72,7 +72,9 @@ def strict_schema(schema: dict[str, Any]) -> dict[str, Any]:
             return [walk(x) for x in node]
         if not isinstance(node, dict):
             return node
-        node = {k: walk(v) for k, v in node.items() if k not in ("$schema", "$id", "default")}
+        # Keys of a `properties` map are field names, not keywords: never strip them.
+        node = {k: ({name: walk(p) for name, p in v.items()} if k == "properties" and isinstance(v, dict) else walk(v))
+                for k, v in node.items() if k not in ("$schema", "$id", "default")}
         if node.get("type") == "object" and "properties" in node:
             required = set(node.get("required", []))
             for name, prop in node["properties"].items():
