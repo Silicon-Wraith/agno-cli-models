@@ -9,7 +9,7 @@ from agno.tools import tool
 
 from agno_cli_models._common import find_cli_session, session_marker
 from agno_cli_models.claude.model import ClaudeCodeModel
-from agno_cli_models.errors import ModelRateLimitError
+from agno_cli_models.errors import CliProtocolError, ModelRateLimitError
 
 INIT = sdk.SystemMessage(subtype="init", data={"session_id": "sess-1", "claude_code_version": "2.1.286", "tools": [], "apiKeySource": "none"})
 
@@ -32,6 +32,10 @@ class FakeQuery:
 
         async def gen():
             for item in items:
+                if isinstance(item, BaseException):
+                    raise item
+                if callable(item):
+                    item = await item(options)
                 yield item
 
         return gen()
@@ -155,3 +159,127 @@ def test_fingerprint_matches_options_module():
 
     m = ClaudeCodeModel(builtin_tools=("Read",))
     assert m.config_fingerprint() == fingerprint(("Read",), None)
+
+
+# ---- final review fixes ----
+
+class _Run:
+    session_id, model_provider_data, metrics, requirements = "a", None, None, None
+
+
+def test_sdk_exception_is_typed():
+    with pytest.raises(CliProtocolError) as info:
+        asyncio.run(model(FakeQuery(INIT, sdk.ProcessError("Command failed with exit code 1", exit_code=1)))
+                    .aresponse([Message(role="user", content="q")]))
+    assert isinstance(info.value.__cause__, sdk.ProcessError)
+
+
+def test_query_fn_raising_on_call_is_typed():
+    def boom(*, prompt, options):
+        raise sdk.CLIConnectionError("cannot connect")
+
+    with pytest.raises(CliProtocolError):
+        asyncio.run(model(boom, timeout_s=5).aresponse([Message(role="user", content="q")]))
+
+
+def test_stream_without_result_raises():
+    with pytest.raises(CliProtocolError, match="ended without a result"):
+        asyncio.run(model(FakeQuery(INIT)).aresponse([Message(role="user", content="q")]))
+
+
+def test_aclose_failure_does_not_hang():
+    class BadGen:
+        def __init__(self):
+            self.items = [INIT, result()]
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if not self.items:
+                raise StopAsyncIteration
+            return self.items.pop(0)
+
+        async def aclose(self):
+            raise RuntimeError("close failed")
+
+    out = asyncio.run(asyncio.wait_for(model(lambda **kw: BadGen()).aresponse([Message(role="user", content="q")]), 5))
+    assert out.content == "hello"
+
+
+@tool(name="get__value", requires_confirmation=True)
+def get_value(key: str) -> str:
+    """Get a value.
+
+    Args:
+        key: which
+    """
+    return "v"
+
+
+def test_tool_name_with_double_underscore_pauses_under_full_name():
+    class D:
+        id, name, input = "tu-2", "mcp__agno__get__value", {"key": "k"}
+
+    get_value.process_entrypoint()
+    run = _Run()
+    asyncio.run(model(FakeQuery(INIT, result(deferred_tool_use=D(), result=None)))
+                .aresponse([Message(role="user", content="q")], tools=[get_value], run_response=run))
+    assert run.requirements[0].tool_execution.tool_name == "get__value"
+
+
+RUNS = {"n": 0}
+
+
+@tool(requires_confirmation=True)
+def zap(path: str) -> str:
+    """Zap a path.
+
+    Args:
+        path: what to zap
+    """
+    RUNS["n"] += 1
+    return f"zapped {path}"
+
+
+def test_hook_and_mcp_handler_two_step_approval(monkeypatch):
+    captured = {}
+    real = sdk.create_sdk_mcp_server
+
+    def capture(name, version="1.0.0", tools=None):
+        captured.update({t.name: t.handler for t in tools or []})
+        return real(name, version=version, tools=tools)
+
+    monkeypatch.setattr(sdk, "create_sdk_mcp_server", capture)
+    RUNS["n"] = 0
+    zap.process_entrypoint()
+    seen = {}
+
+    async def first_call(options):
+        hook = options.hooks["PreToolUse"][0].hooks[0]
+        seen["first"] = await hook({"tool_name": "mcp__agno__zap", "tool_input": {"path": "/x"}}, "tu-9", None)
+        return result(deferred_tool_use=type("D", (), {"id": "tu-9", "name": "mcp__agno__zap", "input": {"path": "/x"}})(), result=None)
+
+    run = _Run()
+    msgs = [Message(role="user", content="zap /x")]
+    asyncio.run(model(FakeQuery(INIT, first_call)).aresponse(msgs, tools=[zap], run_response=run))
+    assert seen["first"]["hookSpecificOutput"]["permissionDecision"] == "defer"
+    assert RUNS["n"] == 0 and run.requirements
+
+    # Agno ran the confirmed tool once; resume with its result in the messages.
+    msgs.append(Message(role="tool", tool_call_id="tu-9", tool_name="zap", content="zapped /x"))
+
+    async def second_call(options):
+        hook = options.hooks["PreToolUse"][0].hooks[0]
+        seen["second"] = await hook({"tool_name": "mcp__agno__zap", "tool_input": {"path": "/x"}}, "tu-9", None)
+        seen["handler"] = await captured["zap"]({"path": "/x"})
+        return result(result="done")
+
+    fake = FakeQuery(INIT, second_call)
+    out = asyncio.run(model(fake).aresponse(msgs, tools=[zap]))
+    prompt, options = fake.calls[0]
+    assert prompt == "Continue." and options.resume == "sess-1"
+    assert seen["second"] == {}
+    assert seen["handler"]["content"][0]["text"] == "zapped /x" and seen["handler"]["is_error"] is False
+    assert RUNS["n"] == 0
+    assert out.content == "done"

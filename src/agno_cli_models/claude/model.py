@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Callable
 
 import claude_agent_sdk as sdk
+from agno.exceptions import AgnoError
 from agno.models.response import ModelResponse
 from pydantic import BaseModel
 
@@ -19,6 +20,7 @@ from agno_cli_models._common import find_cli_session, last_user_text, session_ma
 from agno_cli_models.claude.matcher import CallIdMatcher
 from agno_cli_models.claude.options import SERVER, build_options, fingerprint
 from agno_cli_models.claude.translate import check_result, observed_model, rate_limit_error, usage_metrics
+from agno_cli_models.errors import CliProtocolError
 from agno_cli_models.versions import check_supported, installed_version
 
 _DONE = object()
@@ -53,6 +55,14 @@ class ClaudeCodeModel(CliModel):
             check_supported("claude", self._version)
         return self._version
 
+    def _typed(self, exc: Exception) -> Exception:
+        """SDK and transport failures become CliProtocolError; Agno's own errors pass through."""
+        if isinstance(exc, AgnoError):
+            return exc
+        err = CliProtocolError(str(exc) or type(exc).__name__, self.name, self.id)
+        err.__cause__ = exc
+        return err
+
     async def _drive(self, messages, response_format, tools, tool_call_limit, run_response, stream: bool) -> AsyncIterator[ModelResponse]:
         cli = self._cli()
         version = self._cli_version(cli)
@@ -61,7 +71,7 @@ class ClaudeCodeModel(CliModel):
         queue: asyncio.Queue = asyncio.Queue()
         system, rest = split_system(messages)
         resume = find_cli_session(messages, "claude")
-        state: dict[str, Any] = {"session": resume}
+        state: dict[str, Any] = {"session": resume, "result": False}
 
         async def pre_tool_use(inp: dict, tool_use_id: str | None, ctx: Any) -> dict:
             name = inp.get("tool_name", "")
@@ -113,21 +123,29 @@ class ClaudeCodeModel(CliModel):
         query = self.query_fn or sdk.query
 
         async def pump() -> None:
-            gen = query(prompt=prompt, options=options)
+            gen = None
             try:
+                gen = query(prompt=prompt, options=options)
                 async for msg in gen:
                     await queue.put(msg)
             except Exception as exc:
-                await queue.put(exc)
+                await queue.put(self._typed(exc))
             finally:
-                await gen.aclose()
-                await queue.put(_DONE)
+                try:
+                    if gen is not None:
+                        await gen.aclose()
+                except Exception:
+                    pass  # the run is over; a failed close must not hide its outcome
+                finally:
+                    await queue.put(_DONE)
 
         task = asyncio.create_task(pump())
         try:
             while True:
                 item = await queue.get()
                 if item is _DONE:
+                    if not state["result"]:
+                        raise CliProtocolError("claude ended without a result", self.name, self.id)
                     return
                 if isinstance(item, Exception):
                     raise item
@@ -144,12 +162,13 @@ class ClaudeCodeModel(CliModel):
                 elif isinstance(item, sdk.SystemMessage) and item.subtype == "init":
                     state["session"] = item.data.get("session_id") or state["session"]
                 elif isinstance(item, sdk.ResultMessage):
+                    state["result"] = True
                     state["session"] = item.session_id or state["session"]
                     check_result(item, self.name, self.id)
                     info = {"observed_model": observed_model(item), "cli_version": version, "cli_session_id": state["session"]}
                     deferred = item.deferred_tool_use
                     if deferred is not None:
-                        short = deferred.name.split("__")[-1]
+                        short = deferred.name.removeprefix(f"mcp__{SERVER}__")
                         for ev in await bridge.pause(deferred.id, short, deferred.input or {}, provider_data=session_marker("claude", state["session"])):
                             yield ev
                         text = ""
