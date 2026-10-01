@@ -91,6 +91,7 @@ def test_custom_tool_runs_through_agno(make, request):
         usage = [(m["params"]["tokenUsage"].get("last"), m["params"]["tokenUsage"].get("total"))
                  for m in recorded if m.get("method") == "thread/tokenUsage/updated"]
         print("CODEX_TOKEN_USAGE_SEQUENCE", json.dumps(usage))
+        print("CODEX_METRICS", agent.model.last_run_info, out.metrics.input_tokens if out.metrics else None)
 
 
 @pytest.mark.parametrize("make", MODELS)
@@ -126,10 +127,16 @@ def test_approval_reject_never_runs_tool(make):
     CALLS["wipe"] = 0
     agent = Agent(model=make(), tools=[wipe])
     run = agent.run("Delete /tmp/demo.txt using the wipe tool.")
-    for req in run.active_requirements:
+    assert run.is_paused
+    assert run.active_requirements
+    rejected = list(run.active_requirements)
+    for req in rejected:
         req.reject()
     agent.continue_run(run_response=run, requirements=run.requirements)
+    # A model may legitimately retry wipe after a rejection (Claude haiku does), which pauses again;
+    # what matters is that the rejected call never ran and the original requirements were resolved.
     assert CALLS["wipe"] == 0
+    assert all(r.is_resolved() for r in rejected)
 
 
 def test_claude_isolation_sees_only_agno_tools(monkeypatch):
@@ -150,6 +157,7 @@ def test_claude_isolation_sees_only_agno_tools(monkeypatch):
 
     Agent(model=claude(query_fn=spy), tools=[get_secret]).run("Say OK.")
     assert seen["apiKeySource"] == "none"
+    assert seen["tools"] and "mcp__agno__get_secret" in seen["tools"]
     assert all(t.startswith("mcp__agno__") for t in seen["tools"])
     assert [s["name"] for s in seen.get("mcp_servers", [])] == ["agno"]
     assert not seen.get("skills")
@@ -182,7 +190,7 @@ def test_codex_app_server_starts_no_mcp_servers():
             await rpc.close()
 
     res = asyncio.run(go())
-    print("MCP_STATUS_LIST", json.dumps(res))
+    print("MCP_STATUS_LIST", json.dumps(res), "user_server_listed:", bool(res.get("data")))
     for server in res.get("data", []):
         assert not server.get("runtimeStatus"), f"MCP server has runtime status: {server}"
         assert not server.get("serverInfo"), f"MCP server connected: {server}"

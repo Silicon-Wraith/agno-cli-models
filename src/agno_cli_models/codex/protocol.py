@@ -128,7 +128,11 @@ class TurnTracker:
             if item.get("type") == "agentMessage" and item.get("phase") == "final_answer":
                 self.final_text = item.get("text", "")
         elif method == "thread/tokenUsage/updated":
-            self.usage = params.get("tokenUsage", {}).get("last") or {}
+            # `last` is per model call, not per turn: sum across the turn's calls.
+            last = params.get("tokenUsage", {}).get("last") or {}
+            for k, v in last.items():
+                if isinstance(v, int):
+                    self.usage[k] = self.usage.get(k, 0) + v
         elif method == "model/rerouted":
             self.model = params.get("toModel") or self.model
         elif method == "account/rateLimits/updated":

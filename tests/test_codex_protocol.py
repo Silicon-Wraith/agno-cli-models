@@ -74,6 +74,14 @@ def test_tracker_collects_final_answer_usage_and_model():
     assert (m.input_tokens, m.cache_read_tokens, m.output_tokens, m.reasoning_tokens, m.total_tokens) == (100, 40, 7, 3, 107)
 
 
+def test_tracker_sums_per_call_usage_across_updates():
+    t = tracker()
+    t.on_notification("thread/tokenUsage/updated", {"tokenUsage": {"last": {"inputTokens": 5796, "cachedInputTokens": 0, "outputTokens": 26, "reasoningOutputTokens": 0}}})
+    t.on_notification("thread/tokenUsage/updated", {"tokenUsage": {"last": {"inputTokens": 5847, "cachedInputTokens": 5632, "outputTokens": 6, "reasoningOutputTokens": 2}}})
+    m = t.metrics()
+    assert (m.input_tokens, m.cache_read_tokens, m.output_tokens, m.reasoning_tokens, m.total_tokens) == (11643, 5632, 32, 2, 11675)
+
+
 def test_reroute_changes_observed_model():
     t = tracker()
     t.model = "gpt-5.6-sol"
