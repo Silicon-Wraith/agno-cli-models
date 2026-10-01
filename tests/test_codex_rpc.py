@@ -80,8 +80,130 @@ def test_exit_puts_done_in_inbox():
 
 def test_rpc_close_kills_hung_process():
     async def go():
-        rpc = await Rpc.spawn([sys.executable, "-c", "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"], env={"PATH": "/usr/bin"})
+        import json
+        server_code = textwrap.dedent("""
+            import signal, time, sys, json
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            print(json.dumps({"ready": True}), flush=True)
+            time.sleep(60)
+        """)
+        rpc = await Rpc.spawn([sys.executable, "-c", server_code], env={"PATH": "/usr/bin"})
+        await asyncio.wait_for(rpc.inbox.get(), 5)  # wait for ready
         await rpc.close(grace_s=0.5)
-        assert rpc.proc.returncode is not None
+        assert rpc.proc.returncode == -9
+
+    asyncio.run(go())
+
+
+def test_non_json_line_skipped_later_responses_arrive():
+    """A non-JSON line should be skipped; later responses should still arrive."""
+    async def go():
+        server_code = textwrap.dedent("""
+            import json, sys
+            for line in sys.stdin:
+                msg = json.loads(line)
+                if msg.get("method") == "test":
+                    print("not valid json", flush=True)
+                    print(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": {"ok": True}}), flush=True)
+        """)
+        rpc = await Rpc.spawn([sys.executable, "-c", server_code], env={"PATH": "/usr/bin"})
+        try:
+            result = await asyncio.wait_for(rpc.request("test", {}), 5)
+            assert result == {"ok": True}
+        finally:
+            await rpc.close()
+
+    asyncio.run(go())
+
+
+def test_non_dict_json_line_skipped():
+    """A JSON line that is not a dict should be skipped; later responses should still arrive."""
+    async def go():
+        server_code = textwrap.dedent("""
+            import json, sys
+            for line in sys.stdin:
+                msg = json.loads(line)
+                if msg.get("method") == "test":
+                    print(json.dumps(123), flush=True)
+                    print(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": {"ok": True}}), flush=True)
+        """)
+        rpc = await Rpc.spawn([sys.executable, "-c", server_code], env={"PATH": "/usr/bin"})
+        try:
+            result = await asyncio.wait_for(rpc.request("test", {}), 5)
+            assert result == {"ok": True}
+        finally:
+            await rpc.close()
+
+    asyncio.run(go())
+
+
+def test_request_after_server_exit_raises_error():
+    """Calling request() after server has exited should raise CliProtocolError, not hang."""
+    async def go():
+        server_code = textwrap.dedent("""
+            import json, sys
+            for line in sys.stdin:
+                msg = json.loads(line)
+                if msg.get("method") == "quit":
+                    sys.exit(0)
+        """)
+        rpc = await Rpc.spawn([sys.executable, "-c", server_code], env={"PATH": "/usr/bin"})
+        try:
+            # Tell server to exit
+            await rpc.send({"jsonrpc": "2.0", "method": "quit"})
+            # Wait for server to exit and DONE sentinel
+            await asyncio.wait_for(rpc.inbox.get(), 5)
+
+            # Now try to make a request after server is dead
+            with pytest.raises(CliProtocolError):
+                await asyncio.wait_for(rpc.request("test", {}), 5)
+        finally:
+            await rpc.close()
+
+    asyncio.run(go())
+
+
+def test_server_exit_during_outstanding_request_raises_error():
+    """Server exiting while request is outstanding should raise CliProtocolError, not hang."""
+    async def go():
+        server_code = textwrap.dedent("""
+            import json, sys, time
+            for line in sys.stdin:
+                msg = json.loads(line)
+                if msg.get("method") == "hang-then-exit":
+                    time.sleep(0.5)
+                    sys.exit(1)
+        """)
+        rpc = await Rpc.spawn([sys.executable, "-c", server_code], env={"PATH": "/usr/bin"})
+        try:
+            # Make request and wait for error as server exits
+            with pytest.raises(CliProtocolError):
+                await asyncio.wait_for(rpc.request("hang-then-exit", {}), 5)
+        finally:
+            await rpc.close()
+
+    asyncio.run(go())
+
+
+def test_oversized_line_fails_pending_requests():
+    """A line over the limit should fail pending requests with CliProtocolError."""
+    async def go():
+        # Create an RPC with a small limit to test oversized line handling
+        server_code = textwrap.dedent("""
+            import json, sys
+            for line in sys.stdin:
+                msg = json.loads(line)
+                if msg.get("method") == "oversized":
+                    # Send a very large JSON object (much larger than typical)
+                    large_data = "x" * (20 * 1024 * 1024)  # 20 MiB
+                    print(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": {"data": large_data}}), flush=True)
+        """)
+        rpc = await Rpc.spawn([sys.executable, "-c", server_code], env={"PATH": "/usr/bin"})
+        try:
+            # This should fail with CliProtocolError due to oversized line
+            with pytest.raises(CliProtocolError):
+                await asyncio.wait_for(rpc.request("oversized", {}), 5)
+        finally:
+            await rpc.close()
 
     asyncio.run(go())
