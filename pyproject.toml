@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agno-cli-models"
+version = "0.1.0"
+description = "Agno models backed by the official Claude Code and Codex clients."
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.11"
+dependencies = [
+    "agno>=3.0.11,<3.1",
+    "claude-agent-sdk>=0.2.163,<0.3",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "sqlalchemy[asyncio]>=2"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--strict-markers -m 'not integration'"
+markers = ["integration: real Claude Code or Codex calls; spends subscription quota; run on purpose only"]
