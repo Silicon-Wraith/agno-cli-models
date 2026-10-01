@@ -15,7 +15,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8"]
+dev = ["pytest>=8", "sqlalchemy[asyncio]>=2"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
