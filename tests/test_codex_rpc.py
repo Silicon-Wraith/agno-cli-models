@@ -125,12 +125,17 @@ def test_non_dict_json_line_skipped():
                 msg = json.loads(line)
                 if msg.get("method") == "test":
                     print(json.dumps(123), flush=True)
+                    print(json.dumps({"jsonrpc": "2.0", "method": "notification", "params": {}}), flush=True)
                     print(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": {"ok": True}}), flush=True)
         """)
         rpc = await Rpc.spawn([sys.executable, "-c", server_code], env={"PATH": "/usr/bin"})
         try:
             result = await asyncio.wait_for(rpc.request("test", {}), 5)
             assert result == {"ok": True}
+            # Verify that the next inbox item is the notification (the non-dict 123 should have been skipped)
+            notification = await asyncio.wait_for(rpc.inbox.get(), 5)
+            assert isinstance(notification, dict), f"Expected dict notification, got {type(notification).__name__}: {notification}"
+            assert notification.get("method") == "notification"
         finally:
             await rpc.close()
 
@@ -186,9 +191,8 @@ def test_server_exit_during_outstanding_request_raises_error():
 
 
 def test_oversized_line_fails_pending_requests():
-    """A line over the limit should fail pending requests with CliProtocolError."""
+    """A line over the limit should fail pending requests with CliProtocolError mentioning oversized."""
     async def go():
-        # Create an RPC with a small limit to test oversized line handling
         server_code = textwrap.dedent("""
             import json, sys
             for line in sys.stdin:
@@ -201,8 +205,34 @@ def test_oversized_line_fails_pending_requests():
         rpc = await Rpc.spawn([sys.executable, "-c", server_code], env={"PATH": "/usr/bin"})
         try:
             # This should fail with CliProtocolError due to oversized line
-            with pytest.raises(CliProtocolError):
+            with pytest.raises(CliProtocolError) as exc_info:
                 await asyncio.wait_for(rpc.request("oversized", {}), 5)
+            # Verify the error message mentions oversized
+            assert "oversized" in str(exc_info.value).lower(), f"Expected 'oversized' in error message, got: {exc_info.value}"
+        finally:
+            await rpc.close()
+
+    asyncio.run(go())
+
+
+def test_clean_server_exit_says_exited():
+    """A clean server exit should fail pending with 'exited' message, not a specific error."""
+    async def go():
+        server_code = textwrap.dedent("""
+            import json, sys, time
+            for line in sys.stdin:
+                msg = json.loads(line)
+                if msg.get("method") == "wait":
+                    time.sleep(0.2)
+                    sys.exit(0)  # Clean exit
+        """)
+        rpc = await Rpc.spawn([sys.executable, "-c", server_code], env={"PATH": "/usr/bin"})
+        try:
+            # This should fail with generic "exited" message on clean exit
+            with pytest.raises(CliProtocolError) as exc_info:
+                await asyncio.wait_for(rpc.request("wait", {}), 5)
+            # Verify the error message says "exited"
+            assert "exited" in str(exc_info.value).lower(), f"Expected 'exited' in error message, got: {exc_info.value}"
         finally:
             await rpc.close()
 
