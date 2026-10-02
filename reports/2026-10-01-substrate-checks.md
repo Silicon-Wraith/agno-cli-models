@@ -62,4 +62,52 @@ Notifications, with time from `turn/start`:
 
 ### Setup
 
-(filled in after the runs)
+- **Harness:** `tools/measure_cadence.py`, kept in the repo so the measurement can be rerun on a new CLI version or model.
+  - It wraps `ClaudeCodeModel.query_fn` and stamps every message `claude_agent_sdk.query` yields with `time.monotonic()`. That is the point an idle clock in the package would see.
+  - It drives the real model through an Agno `Agent`.
+- **Settings, matching Sendesis `profiles/claude-opus.yaml`:** `claude-opus-5-5`, effort `high`, `max_turns=20`. Wall clock 900 s, so slow runs are not cut off.
+- **Prompt shapes:**
+  - `review`: a Sendesis-style security review of a diff. Tools Read, Grep and Glob; nested `output_schema`; the model must read `app.py`.
+  - `puzzle`: Hertzsprung's problem for n=8. Long thinking, short answer.
+  - `essay`: about 1200 words of plain prose. Long generation, no tools.
+- **Modes:** `nonstream`, where `include_partial_messages` is off and the SDK yields whole messages, and `stream`, where it is on.
+- **Runs:** 2 repetitions of each shape and mode, 12 runs in all, run one after another.
+- **Raw data:** `reports/2026-10-01-substrate-checks-claude.jsonl`. Each line has every message's arrival time and kind, the top 5 gaps and the message pair bounding each.
+
+**Already visible in a Haiku smoke run:** the CLI sends `system:thinking_tokens` progress messages *during thinking*, even in non-stream mode. In stream mode, thinking also arrives as `thinking_delta` events. Thinking is therefore not silent at the SDK layer.
+
+### Results (14 runs, all healthy, Claude Code 2.1.287)
+
+The 12 planned runs, plus 2 `longthink` runs, one per mode. Those were added because the first 12 produced little thinking. The `longthink` prompt is a hand-computed recurrence for n=10.
+
+| Shape | Mode | Duration (s) | Longest thinking stretch (s) | Max gap after init (s) | Messages bounding the max gap |
+| --- | --- | --- | --- | --- | --- |
+| review | stream | 13.6 / 10.7 | 0 / 0 | **5.55** / 1.33 | `system:status` → `stream:message_start` (new turn after a tool result) |
+| puzzle | stream | 19.5 / 19.8 | 10.9 / 10.7 | 1.38 / 1.40 | `thinking_delta` → `system:thinking_tokens` |
+| essay | stream | 44.1 / 45.5 | 7.8 / 10.0 | 1.48 / 1.45 | `thinking_delta` → `system:thinking_tokens` |
+| longthink | stream | 30.7 | 17.0 | 1.50 | `thinking_delta` → `system:thinking_tokens` |
+| review | nonstream | 9.9 / 9.2 | 0 / 0 | 6.52 / 5.70 | `UserMessage` → `assistant:ToolUseBlock` (one whole model turn) |
+| puzzle | nonstream | 29.3 / 15.2 | 18.3 / 3.0 | 8.13 / 9.51 | `ThinkingBlock` → `TextBlock` (the whole answer text) |
+| essay | nonstream | 40.3 / 48.3 | 4.5 / 8.0 | **32.69 / 37.50** | `ThinkingBlock` → `TextBlock` (the whole 1200-word answer) |
+| longthink | nonstream | 30.2 | 16.0 | 11.26 | `ThinkingBlock` → `TextBlock` |
+
+- **Startup** (spawn to `init`): 0.56–1.74 s.
+- **Gaps inside text deltas** (stream): at most 0.14 s.
+- **Gaps inside thinking** (both modes): at most 1.65 s.
+
+### Findings
+
+1. **Thinking is never silent at the SDK layer.** During thinking the CLI sends `system:thinking_tokens` about every 1.2–1.7 s, in non-stream mode too. In stream mode it also sends `thinking_delta` events. Over the longest observed stretch, 18 s, no gap inside thinking exceeded 1.65 s.
+2. **In stream mode the longest gap is the start of a new model turn**: 5.55 s from a tool result to the next `message_start`, which is API time to first token. Every other gap was at most 2 s.
+3. **In non-stream mode the gap grows with the answer length.** The whole text block arrives as one `AssistantMessage` after generation ends: 37.5 s for about 1200 words. An idle limit at any fixed value would trip on a long enough non-stream answer. **A Claude idle limit therefore needs `include_partial_messages` on whenever `idle_timeout_s` is set**, whatever the caller's stream mode. The deltas are counted by the idle clock but not yielded to a non-streaming caller.
+4. **The pre-registered rule gives 60 s:** 2 × 5.55 = 11.1 s, rounded up to 30 s, then the 60 s floor applies. That is about 10× the largest observed stream gap.
+
+### Limits of this measurement
+
+- **Thinking for minutes was not produced** at effort `high` on claude-opus-5-5. The longest stretch was 18 s, so constant cadence during much longer thinking is assumed from the 1.2–1.7 s `thinking_tokens` rhythm, not observed.
+- **Not covered:**
+  - Claude Code's own API retries and backoff, on overload or 5xx. None occurred, and it is not known whether the CLI sends messages while backing off.
+  - Very slow tools. A slow Agno tool runs in the caller's process, and the idle clock should not count that time against the CLI.
+  - Rate-limit waits.
+- **The result is specific to** Claude Code 2.1.287, claude-opus-5-5 and effort `high`. Re-measure with `tools/measure_cadence.py` when any of them changes.
+- **Sample size:** 14 runs, all on 2026-10-01, sequential, on one machine.
