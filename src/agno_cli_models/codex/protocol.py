@@ -107,9 +107,10 @@ def app_server_argv(binary: str) -> list[str]:
     return [binary, "app-server", *FIXED_CONFIG, *_user_mcp_overrides(), *_user_skill_overrides()]
 
 
-def fingerprint(sandbox: str, builtin_tools: bool) -> str:
+def fingerprint(sandbox: str, builtin_tools: bool, idle_timeout_s: float | None = None) -> str:
     return config_hash({"cli": "codex", "config": FIXED_CONFIG, "approval_policy": "never",
                         "allow_model_fallback": False, "sandbox": sandbox, "builtin_tools": builtin_tools,
+                        "idle_timeout_s": idle_timeout_s,
                         "env": "clean_env/v2", "schema": "strict", "user_mcp_servers": "disabled",
                         "user_skills": "disabled", "personality": PERSONALITY})
 
@@ -169,6 +170,12 @@ class TurnTracker:
     done: bool = False
     interrupted: bool = False
     _final_items: set = field(default_factory=set)
+    _open_items: set = field(default_factory=set)
+
+    @property
+    def answer_open(self) -> bool:
+        """A final-answer item has started and not yet completed."""
+        return bool(self._open_items)
 
     def _raise(self, message: str, info: Any) -> None:
         if info in _RATE_INFOS:
@@ -182,12 +189,14 @@ class TurnTracker:
             item = params.get("item", {})
             if item.get("type") == "agentMessage" and item.get("phase") == "final_answer":
                 self._final_items.add(item.get("id"))
+                self._open_items.add(item.get("id"))
         elif method == "item/agentMessage/delta" and params.get("itemId") in self._final_items:
             return [ModelResponse(content=params.get("delta", ""))]
         elif method == "item/completed":
             item = params.get("item", {})
             if item.get("type") == "agentMessage" and item.get("phase") == "final_answer":
                 self.final_text = item.get("text", "")
+                self._open_items.discard(item.get("id"))
         elif method == "thread/tokenUsage/updated":
             # `last` is per model call, not per turn: sum across the turn's calls.
             last = (params.get("tokenUsage") or {}).get("last") or {}

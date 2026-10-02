@@ -9,7 +9,7 @@ from agno.tools import tool
 
 from agno_cli_models._common import find_cli_session, session_marker
 from agno_cli_models.claude.model import ClaudeCodeModel
-from agno_cli_models.errors import CliProtocolError, ModelRateLimitError
+from agno_cli_models.errors import CliProtocolError, CliStallError, CliTimeoutError, ModelRateLimitError
 
 INIT = sdk.SystemMessage(subtype="init", data={"session_id": "sess-1", "claude_code_version": "2.1.286", "tools": [], "apiKeySource": "none"})
 
@@ -158,7 +158,7 @@ def test_fingerprint_matches_options_module():
     from agno_cli_models.claude.options import fingerprint
 
     m = ClaudeCodeModel(builtin_tools=("Read",))
-    assert m.config_fingerprint() == fingerprint(("Read",), None)
+    assert m.config_fingerprint() == fingerprint(("Read",), None, 60.0)
 
 
 # ---- final review fixes ----
@@ -353,3 +353,132 @@ def test_unreadable_version_is_probed_and_warned_once(monkeypatch):
         asyncio.run(m.aresponse([Message(role="user", content="q")]))
     asyncio.run(m.aresponse([Message(role="user", content="q")]))
     assert len(probes) == 1 and m.last_run_info["cli_version"] is None
+
+
+# ---- idle limit ----
+
+def stream_event(event):
+    return sdk.StreamEvent(uuid="u", session_id="sess-1", event=event)
+
+
+TEXT_START = stream_event({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}})
+TEXT_STOP = stream_event({"type": "content_block_stop", "index": 0})
+THINKING = sdk.SystemMessage(subtype="thinking_tokens", data={})
+
+
+def delta(text):
+    return stream_event({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text}})
+
+
+def after(seconds, item):
+    async def wait(options):
+        await asyncio.sleep(seconds)
+        return item
+
+    return wait
+
+
+def ask(m, **kw):
+    return asyncio.run(m.aresponse([Message(role="user", content="q")], **kw))
+
+
+def test_silence_after_the_answer_opens_raises_stall():
+    with pytest.raises(CliStallError) as info:
+        ask(model(FakeQuery(INIT, TEXT_START, after(5, result())), idle_timeout_s=0.2, timeout_s=5))
+    err = info.value
+    assert err.idle_s == 0.2 and err.last_method == "stream_event:content_block_start" and err.answer_open is True
+    assert isinstance(err, CliTimeoutError) and err.status_code == 504
+
+
+def test_stall_before_any_answer_reports_answer_closed():
+    with pytest.raises(CliStallError) as info:
+        ask(model(FakeQuery(INIT, after(5, result())), idle_timeout_s=0.1, timeout_s=5))
+    assert info.value.last_method == "system:init" and info.value.answer_open is False
+
+
+def test_a_closed_text_block_is_no_longer_open():
+    with pytest.raises(CliStallError) as info:
+        ask(model(FakeQuery(INIT, TEXT_START, delta("hi"), TEXT_STOP, after(5, result())), idle_timeout_s=0.1, timeout_s=5))
+    assert info.value.answer_open is False
+
+
+def test_pauses_below_the_idle_limit_do_not_trip():
+    fake = FakeQuery(INIT, after(0.1, THINKING), after(0.1, TEXT_START), after(0.1, delta("hello")), after(0.1, result()))
+    assert ask(model(fake, idle_timeout_s=0.5, timeout_s=5)).content == "hello"
+
+
+def chatty(*, prompt, options):
+    async def gen():
+        yield INIT
+        while True:
+            await asyncio.sleep(0.05)
+            yield THINKING
+
+    return gen()
+
+
+def test_wall_clock_still_fires_on_a_slow_but_chatty_stream():
+    with pytest.raises(CliTimeoutError) as info:
+        ask(model(chatty, idle_timeout_s=5, timeout_s=0.5))
+    assert type(info.value) is CliTimeoutError
+
+
+def test_no_idle_limit_leaves_only_the_wall_clock():
+    with pytest.raises(CliTimeoutError) as info:
+        ask(model(FakeQuery(INIT, after(5, result())), idle_timeout_s=None, timeout_s=0.3))
+    assert type(info.value) is CliTimeoutError
+
+
+def slow_lookup(key: str) -> str:
+    """Look up slowly.
+
+    Args:
+        key: what to look up
+    """
+    import time
+
+    time.sleep(0.4)
+    return f"value of {key}"
+
+
+def test_time_spent_in_an_agno_tool_is_not_idle_time(monkeypatch):
+    captured = {}
+    real = sdk.create_sdk_mcp_server
+
+    def capture(name, version="1.0.0", tools=None):
+        captured.update({t.name: t.handler for t in tools or []})
+        return real(name, version=version, tools=tools)
+
+    monkeypatch.setattr(sdk, "create_sdk_mcp_server", capture)
+    seen = {}
+
+    async def call_tool(options):
+        hook = options.hooks["PreToolUse"][0].hooks[0]
+        await hook({"tool_name": "mcp__agno__slow_lookup", "tool_input": {"key": "k"}}, "tu-1", None)
+        seen["handler"] = await captured["slow_lookup"]({"key": "k"})
+        # The CLI answers a moment after the tool: silence is counted from the tool's end.
+        await asyncio.sleep(0.05)
+        return result(result="done")
+
+    from agno.tools.function import Function
+
+    fn = Function.from_callable(slow_lookup)
+    fn.process_entrypoint()
+    out = ask(model(FakeQuery(INIT, call_tool), idle_timeout_s=0.1, timeout_s=5), tools=[fn])
+    assert seen["handler"]["content"][0]["text"] == "value of k" and out.content == "done"
+
+
+def test_an_idle_limit_turns_partial_messages_on_without_streaming_them():
+    fake = FakeQuery(INIT, TEXT_START, delta("hel"), delta("lo"), TEXT_STOP, result(result="hello"))
+    out = ask(model(fake, idle_timeout_s=60))
+    assert fake.calls[0][1].include_partial_messages is True
+    assert out.content == "hello"
+    fake = FakeQuery(INIT, result())
+    ask(model(fake, idle_timeout_s=None))
+    assert fake.calls[0][1].include_partial_messages is False
+
+
+def test_idle_limit_default_and_fingerprint():
+    assert ClaudeCodeModel().idle_timeout_s == 60.0
+    assert ClaudeCodeModel(idle_timeout_s=60.0).config_fingerprint() != ClaudeCodeModel(idle_timeout_s=30.0).config_fingerprint()
+    assert ClaudeCodeModel(idle_timeout_s=60.0).config_fingerprint() != ClaudeCodeModel(idle_timeout_s=None).config_fingerprint()

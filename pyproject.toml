@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agno-cli-models"
-version = "0.1.1"
+version = "0.1.2"
 description = "Agno models backed by the official Claude Code and Codex clients."
 readme = "README.md"
 license = {text = "MIT"}

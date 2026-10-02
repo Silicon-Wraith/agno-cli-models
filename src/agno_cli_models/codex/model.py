@@ -3,6 +3,7 @@ using the CLI's own ChatGPT login."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Awaitable, Callable
@@ -27,7 +28,7 @@ from agno_cli_models.codex.protocol import (
     turn_start_params,
 )
 from agno_cli_models.codex.rpc import DONE, Rpc
-from agno_cli_models.errors import CliProtocolError
+from agno_cli_models.errors import CliProtocolError, CliStallError
 from agno_cli_models.versions import check_supported, installed_version
 
 
@@ -46,6 +47,7 @@ class CodexModel(CliModel):
     name: str = "Codex"
     provider: str = "Codex"
     effort: str = "high"
+    idle_timeout_s: float | None = 60.0
     sandbox: str = "read-only"
     builtin_tools: bool = False
     codex_bin: str = "codex"
@@ -55,7 +57,7 @@ class CodexModel(CliModel):
     CLI = "codex"
 
     def config_fingerprint(self) -> str:
-        return fingerprint(self.sandbox, self.builtin_tools)
+        return fingerprint(self.sandbox, self.builtin_tools, self.idle_timeout_s)
 
     def _cli_version(self) -> str | None:
         if not self._version_checked:
@@ -125,10 +127,20 @@ class CodexModel(CliModel):
             turn_id = turn.get("turn", {}).get("id")
 
             paused = False
+            last_method = None
             while not tracker.done:
-                msg = await rpc.inbox.get()
+                # The idle clock covers only this wait: everything Rpc._read gets from the
+                # app-server lands in the inbox, and Agno tools run between waits.
+                try:
+                    async with asyncio.timeout(self.idle_timeout_s):
+                        msg = await rpc.inbox.get()
+                except TimeoutError:
+                    raise CliStallError(f"codex sent nothing for {self.idle_timeout_s}s (last: {last_method})",
+                                        self.name, self.id, idle_s=self.idle_timeout_s, last_method=last_method,
+                                        answer_open=tracker.answer_open) from None
                 if msg is DONE:
                     raise CliProtocolError("codex app-server exited mid-turn", self.name, self.id)
+                last_method = msg.get("method") or last_method
                 method, params = msg.get("method"), msg.get("params") or {}
                 if method == "item/tool/call" and "id" in msg:
                     name, call_id, args = params.get("tool"), params.get("callId"), params.get("arguments") or {}
