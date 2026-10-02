@@ -32,6 +32,8 @@ class CliModel(Model):
     supports_native_structured_outputs: bool = True
     cwd: str | None = None
     timeout_s: float = 600.0
+    # Longest silence from the CLI a call tolerates; None turns the idle limit off.
+    idle_timeout_s: float | None = None
     last_run_info: dict = field(default_factory=dict, repr=False)
     CLI: ClassVar[str] = ""
 

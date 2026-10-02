@@ -22,7 +22,8 @@ from agno_cli_models._common import find_cli_session, last_user_text, session_ma
 from agno_cli_models.claude.matcher import CallIdMatcher
 from agno_cli_models.claude.options import SERVER, build_options, fingerprint
 from agno_cli_models.claude.translate import check_result, observed_model, rate_limit_error, usage_metrics
-from agno_cli_models.errors import CliProtocolError, ContextWindowExceededError, ModelProviderError, ModelRateLimitError
+from agno_cli_models.errors import (CliProtocolError, CliStallError, CliTimeoutError, ContextWindowExceededError,
+                                    ModelProviderError, ModelRateLimitError)
 from agno_cli_models.versions import check_supported, installed_version
 
 _DONE = object()
@@ -32,12 +33,36 @@ class _StaleSession(Exception):
     """Resuming the persisted CLI session failed before the session started."""
 
 
+def _kind(item: Any) -> str | None:
+    """A short name for the last thing received, reported by CliStallError."""
+    if isinstance(item, sdk.SystemMessage):
+        return f"system:{item.subtype}"
+    if isinstance(item, sdk.StreamEvent):
+        return f"stream_event:{item.event.get('type')}"
+    if isinstance(item, ModelResponse):
+        return "agno_tool"
+    if item is _DONE or isinstance(item, Exception):
+        return None
+    return type(item).__name__
+
+
+def _track_text_blocks(event: dict, open_text: set) -> None:
+    """Text content blocks started and not yet stopped: an answer is being written."""
+    if event.get("type") == "content_block_start" and (event.get("content_block") or {}).get("type") == "text":
+        open_text.add(event.get("index"))
+    elif event.get("type") == "content_block_stop":
+        open_text.discard(event.get("index"))
+
+
 @dataclass
 class ClaudeCodeModel(CliModel):
     id: str = "claude-opus-5-5"
     name: str = "ClaudeCode"
     provider: str = "ClaudeCode"
     effort: str = "high"
+    # Measured for Claude Code 2.1.287, claude-opus-5-5, effort high
+    # (reports/2026-10-01-substrate-checks.md); re-measure when any of them changes.
+    idle_timeout_s: float | None = 60.0
     builtin_tools: tuple[str, ...] = ()
     permission_mode: str | None = None
     max_turns: int | None = 50
@@ -48,7 +73,7 @@ class ClaudeCodeModel(CliModel):
     CLI = "claude"
 
     def config_fingerprint(self) -> str:
-        return fingerprint(self.builtin_tools, self.permission_mode)
+        return fingerprint(self.builtin_tools, self.permission_mode, self.idle_timeout_s)
 
     def _cli(self) -> str:
         path = self.cli_path or shutil.which("claude")
@@ -92,7 +117,8 @@ class ClaudeCodeModel(CliModel):
         matcher = CallIdMatcher()
         queue: asyncio.Queue = asyncio.Queue()
         system, rest = split_system(messages)
-        state: dict[str, Any] = {"session": resume, "result": False, "init": False}
+        state: dict[str, Any] = {"session": resume, "result": False, "init": False, "tools_running": 0, "tool_ended": float("-inf"),
+                                "open_text": set()}
 
         async def pre_tool_use(inp: dict, tool_use_id: str | None, ctx: Any) -> dict:
             name = inp.get("tool_name", "")
@@ -107,16 +133,22 @@ class ClaudeCodeModel(CliModel):
 
         def handler_for(fn_name: str):
             async def handler(args: dict) -> dict:
-                call_id = matcher.take(fn_name, args)
-                done = bridge.precomputed(call_id)
-                if done is not None:
-                    text, ok = done
-                else:
-                    marker = session_marker("claude", state["session"]) if state["session"] else None
-                    events, text, ok = await bridge.run(call_id, fn_name, args, provider_data=marker)
-                    for ev in events:
-                        await queue.put(ev)
-                return {"content": [{"type": "text", "text": text}], "is_error": not ok}
+                # While an Agno tool runs here the CLI is waiting on us, so the idle clock holds.
+                state["tools_running"] += 1
+                try:
+                    call_id = matcher.take(fn_name, args)
+                    done = bridge.precomputed(call_id)
+                    if done is not None:
+                        text, ok = done
+                    else:
+                        marker = session_marker("claude", state["session"]) if state["session"] else None
+                        events, text, ok = await bridge.run(call_id, fn_name, args, provider_data=marker)
+                        for ev in events:
+                            await queue.put(ev)
+                    return {"content": [{"type": "text", "text": text}], "is_error": not ok}
+                finally:
+                    state["tools_running"] -= 1
+                    state["tool_ended"] = asyncio.get_running_loop().time()
 
             return handler
 
@@ -135,6 +167,7 @@ class ClaudeCodeModel(CliModel):
             agno_tool_names=list(bridge.functions), mcp_server=sdk.create_sdk_mcp_server(SERVER, tools=sdk_tools) if sdk_tools else None,
             output_schema=schema, resume=resume, stream=stream,
             hooks={"PreToolUse": [sdk.HookMatcher(matcher=None, hooks=[pre_tool_use])]}, max_turns=self.max_turns,
+            idle_timeout_s=self.idle_timeout_s,
         )
         if resume:
             prompt = "Continue." if rest and rest[-1].role == "tool" else last_user_text(rest)
@@ -168,7 +201,9 @@ class ClaudeCodeModel(CliModel):
         except ModelProviderError as exc:
             # The SDK reports a missing --resume session only as a failed process with
             # no detail, so any non-quota failure before the init message counts as one.
-            if resume and not state["init"] and not isinstance(exc, (ModelRateLimitError, ContextWindowExceededError)):
+            # A stall is not one: retrying would hide it and double the call.
+            if resume and not state["init"] and not isinstance(
+                    exc, (ModelRateLimitError, ContextWindowExceededError, CliTimeoutError)):
                 raise _StaleSession() from exc
             raise
         finally:
@@ -179,10 +214,36 @@ class ClaudeCodeModel(CliModel):
                 except (asyncio.CancelledError, Exception):
                     pass
 
+    async def _next(self, queue: asyncio.Queue, state: dict, last: str | None) -> Any:
+        """The next item from the SDK pump. The idle clock covers only this wait, and counts
+        silence from the later of the last item and the end of the last Agno tool call."""
+        idle = self.idle_timeout_s
+        if idle is None:
+            return await queue.get()
+        loop = asyncio.get_running_loop()
+        waiting_since = loop.time()
+        while True:
+            if state["tools_running"]:
+                remaining = idle
+            else:
+                remaining = idle - (loop.time() - max(waiting_since, state["tool_ended"]))
+                if remaining <= 0:
+                    raise CliStallError(f"claude sent nothing for {idle}s (last: {last})", self.name, self.id,
+                                        idle_s=idle, last_method=last, answer_open=bool(state["open_text"]))
+            try:
+                async with asyncio.timeout(remaining):
+                    return await queue.get()
+            except TimeoutError:
+                continue
+
     async def _consume(self, queue: asyncio.Queue, state: dict, bridge: ToolBridge, version: str | None,
                        resuming_after_pause: bool) -> AsyncIterator[ModelResponse]:
+        last = None
         while True:
-            item = await queue.get()
+            item = await self._next(queue, state, last)
+            last = _kind(item) or last
+            if isinstance(item, sdk.StreamEvent):
+                _track_text_blocks(item.event, state["open_text"])
             if item is _DONE:
                 if not state["result"]:
                     raise CliProtocolError("claude ended without a result", self.name, self.id)

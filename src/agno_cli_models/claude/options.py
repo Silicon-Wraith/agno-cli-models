@@ -20,7 +20,7 @@ REFUSED_PERMISSION_MODES = ("bypassPermissions",)
 ENV_POLICY = "blank-api-keys-and-claude-vars/v2"
 
 
-def fingerprint(builtin_tools: Sequence[str], permission_mode: str | None) -> str:
+def fingerprint(builtin_tools: Sequence[str], permission_mode: str | None, idle_timeout_s: float | None = None) -> str:
     return config_hash({
         "cli": "claude",
         "settings": ISOLATION_SETTINGS,
@@ -30,13 +30,16 @@ def fingerprint(builtin_tools: Sequence[str], permission_mode: str | None) -> st
         "builtin_tools": sorted(builtin_tools),
         "permission_mode": permission_mode,
         "env": ENV_POLICY,
+        "idle_timeout_s": idle_timeout_s,
     })
 
 
 def build_options(*, model_id: str, effort: str, cli_path: str, cwd: str, system_prompt: str,
                   builtin_tools: Sequence[str], permission_mode: str | None, agno_tool_names: Sequence[str],
                   mcp_server: Any | None, output_schema: dict | None, resume: str | None, stream: bool,
-                  hooks: dict | None, max_turns: int | None) -> sdk.ClaudeAgentOptions:
+                  hooks: dict | None, max_turns: int | None, idle_timeout_s: float | None = None) -> sdk.ClaudeAgentOptions:
+    """An idle limit needs partial messages even when the caller does not stream: without them a
+    long answer arrives as one message after a silence as long as its generation."""
     if permission_mode in REFUSED_PERMISSION_MODES:
         raise ValueError(f"permission_mode {permission_mode!r} is not allowed")
     allowed = list(builtin_tools) + [f"mcp__{SERVER}__{n}" for n in agno_tool_names]
@@ -53,7 +56,7 @@ def build_options(*, model_id: str, effort: str, cli_path: str, cwd: str, system
         settings=json.dumps(ISOLATION_SETTINGS, sort_keys=True),
         extra_args={"disable-slash-commands": None},
         env=blanking_overrides(),
-        include_partial_messages=stream,
+        include_partial_messages=stream or idle_timeout_s is not None,
         max_turns=max_turns,
     )
     if permission_mode:

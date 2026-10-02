@@ -64,6 +64,7 @@ Both models subclass `CliModel`, exported from the package root for type checks 
 | `effort` | `"high"` | Reasoning effort, pinned on every call |
 | `cwd` | `None` | Working directory for the CLI. Default is an empty directory, `~/.cache/agno-cli-models/empty` |
 | `timeout_s` | `600.0` | Hard wall-clock limit per call. Exceeding it raises `CliTimeoutError` |
+| `idle_timeout_s` | `60.0` | Longest silence from the CLI a call tolerates. Exceeding it raises `CliStallError`. `None` turns it off and leaves only `timeout_s`. See Idle limit |
 
 `ClaudeCodeModel` (default `id="claude-opus-5-5"`):
 
@@ -112,7 +113,7 @@ Both:
 
 The CLI session id (Claude session or Codex thread) is stored in `provider_data` on assistant messages, so Agno's own history persists it. A new agent instance with the same `session_id` resumes the CLI session. Resume needs `add_history_to_context=True`.
 
-If the stored CLI session no longer exists (its files were cleaned up, or the Agno session moved to another machine), the model logs a warning, starts a new CLI session with the Agno history replayed as a transcript, and stores the new session id. Codex retries only when `thread/resume` gets an error reply. Claude's SDK reports a missing session only as a failed process, so Claude retries when resuming fails before the session starts, unless the failure is a rate limit or context overflow:
+If the stored CLI session no longer exists (its files were cleaned up, or the Agno session moved to another machine), the model logs a warning, starts a new CLI session with the Agno history replayed as a transcript, and stores the new session id. Codex retries only when `thread/resume` gets an error reply. Claude's SDK reports a missing session only as a failed process, so Claude retries when resuming fails before the session starts, unless the failure is a rate limit, a context overflow, or a timeout or stall:
 
 ```python
 from agno.db.sqlite import SqliteDb
@@ -162,6 +163,17 @@ The `continue_run` call above is the Agno 3.0.11 form.
 - In stream mode the stored assistant message is the concatenation of the streamed deltas, so for Claude it can differ from the non-stream answer, which is the CLI's final result text.
 - Structured output is parsed only on the non-stream path.
 
+## Idle limit
+
+A stalled stream looks like a slow one to a wall clock. `idle_timeout_s` tells them apart: when the CLI sends nothing for that long, the call raises `CliStallError` instead of waiting out `timeout_s`. The wall clock stays as it is and still bounds a slow but chatty call.
+
+- **Codex:** the clock covers the turn, from the `turn/start` reply to `turn/completed`, and resets on every message from `codex app-server`: item events, deltas, token updates and reconnect notices. `initialize` and `thread/start` stay under `timeout_s` only.
+- **Claude:** the clock runs from the start of `query()` and resets on every SDK message, including the `thinking_tokens` messages the CLI sends while the model thinks. With an idle limit set, the package asks for partial messages even when you do not stream. Without them a long answer arrives as one message after a silence as long as its generation. The deltas are counted, not passed to a non-streaming caller.
+- **Agno tools:** time spent running your tools does not count for either model; the CLI is waiting on your process then.
+- **The default of 60 s:**
+  - For Claude it is measured: about 10× the longest gap seen in streaming runs of Claude Code 2.1.287 with `claude-opus-5-5` at effort `high` (`reports/2026-10-01-substrate-checks.md`). Re-measure with `tools/measure_cadence.py` when the CLI, model or effort changes.
+  - For Codex it is what callers asked for. Codex's own reconnect waits 300 s and cannot be changed for the built-in provider.
+
 ## Run info
 
 After a run, `model.last_run_info` holds details of the last call, and the same dict is at `run_output.model_provider_data["agno_cli_models"]`:
@@ -200,15 +212,21 @@ Codex usage is summed over every model call in a turn. CLI overhead is large (te
 
 ```python
 from agno_cli_models import (
-    ModelRateLimitError, ModelProviderError, CliTimeoutError, CliProtocolError,
+    ModelRateLimitError, ModelProviderError, CliTimeoutError, CliStallError, CliProtocolError,
 )
 from agno_cli_models.errors import ContextWindowExceededError
 ```
 
 - `ModelRateLimitError`: either CLI reported a rate or usage limit (Agno's own class).
 - `ContextWindowExceededError`: either CLI reported a context overflow (Agno's own class).
-- `ModelProviderError`: other CLI errors, and the base class of the two below.
+- `ModelProviderError`: other CLI errors, and the base class of the ones below.
 - `CliTimeoutError`: no complete answer within `timeout_s` (status 504).
+- `CliStallError`: a subclass of `CliTimeoutError`. The CLI sent nothing for `idle_timeout_s` (status 504). It carries:
+  - `idle_s`: the limit that was hit.
+  - `last_method`: the last message received. That is a Codex notification method such as `item/agentMessage/delta`, or a Claude SDK message kind such as `stream_event:content_block_delta` or `system:thinking_tokens`.
+  - `answer_open`: whether a final-answer item had started and not finished.
+  
+  Catching `CliTimeoutError` still catches stalls.
 - `CliProtocolError`: the CLI exited or spoke outside the protocol, for example Codex exiting mid-turn (status 502).
 
 Because rate limits use Agno's classes, Agno's `FallbackConfig(on_rate_limit=[...])` works with these models without extra code.
@@ -235,6 +253,7 @@ Any other version, or a version that cannot be read, emits `UnsupportedCliVersio
   - **`functions.exec` and `functions.wait`.** These are not a leak: in this model's code mode, every tool call goes through `exec`, including your Agno tools.
 - The tool lists above are what the model reports; Codex does not record the tools it offers. The details are in `reports/2026-10-01-codex-isolation-findings.md`.
 - Every Codex call leaves a session file under `$CODEX_HOME/sessions` containing the prompt.
+- The idle limit may mistake a long API backoff inside the CLI for a stall. Per the Agent SDK docs, Claude Code announces a retry with an `api_retry` system message, which resets the clock (not observed on 2.1.287), but a single backoff longer than `idle_timeout_s` is still raised as `CliStallError`. Codex reconnects are announced the same way, as an `error` notification with `willRetry: true`.
 - Claude's SDK bundles its own CLI, but this package uses the `claude` on `PATH` unless `cli_path` is set, so the version you tested is the version you run.
 - Codex needs the `/usr/bin/bwrap` AppArmor profile on Ubuntu 24.04 for its sandbox.
 

@@ -42,3 +42,10 @@ def test_cli_model_is_exported_from_the_package_root():
     assert "CliModel" in agno_cli_models.__all__
     assert issubclass(agno_cli_models.ClaudeCodeModel, CliModel)
     assert issubclass(agno_cli_models.CodexModel, CliModel)
+
+
+def test_stall_error_is_exported_and_is_a_timeout():
+    import agno_cli_models
+
+    assert "CliStallError" in agno_cli_models.__all__
+    assert issubclass(agno_cli_models.CliStallError, agno_cli_models.CliTimeoutError)

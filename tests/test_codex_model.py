@@ -9,7 +9,7 @@ from agno_cli_models._common import find_cli_session, session_marker
 from agno_cli_models.codex.model import CodexModel
 from agno_cli_models.codex.protocol import PAUSE_TEXT
 from agno_cli_models.codex.rpc import DONE
-from agno_cli_models.errors import CliProtocolError, ModelRateLimitError
+from agno_cli_models.errors import CliProtocolError, CliStallError, CliTimeoutError, ModelRateLimitError
 
 
 class FakeRpc:
@@ -350,3 +350,103 @@ def test_unreadable_version_is_probed_and_warned_once(monkeypatch):
     rpc.script = script()
     asyncio.run(m.aresponse([Message(role="user", content="q")]))
     assert len(probes) == 1 and m.last_run_info["cli_version"] is None
+
+
+# ---- idle limit ----
+
+class TricklingRpc(FakeRpc):
+    """Like FakeRpc, but turn/start's notifications arrive one by one, `gap` seconds apart,
+    and `forever` keeps sending deltas after them until the call is torn down."""
+
+    def __init__(self, notes, gap, forever=False, **kw):
+        super().__init__(script([]), **kw)
+        self.notes, self.gap, self.forever = notes, gap, forever
+
+    async def request(self, method, params):
+        result = await super().request(method, params)
+        if method == "turn/start":
+            asyncio.get_running_loop().create_task(self._trickle())
+        return result
+
+    async def _trickle(self):
+        for n in self.notes:
+            await asyncio.sleep(self.gap)
+            await self.inbox.put(n)
+        while self.forever and not self.closed:
+            await asyncio.sleep(self.gap)
+            await self.inbox.put(note("item/agentMessage/delta", {"itemId": "i1", "delta": "."}))
+
+
+OPEN_ANSWER = [note("item/started", {"item": {"id": "i1", "type": "agentMessage", "phase": "final_answer"}})]
+
+
+def test_silence_after_the_answer_opens_raises_stall():
+    rpc = TricklingRpc(OPEN_ANSWER, gap=0.01)
+    with pytest.raises(CliStallError) as info:
+        asyncio.run(model(rpc, idle_timeout_s=0.2, timeout_s=5).aresponse([Message(role="user", content="hi")]))
+    err = info.value
+    assert err.idle_s == 0.2 and err.last_method == "item/started" and err.answer_open is True
+    assert isinstance(err, CliTimeoutError) and err.status_code == 504
+    assert rpc.closed
+
+
+def test_stall_before_any_answer_reports_answer_closed():
+    rpc = TricklingRpc([note("thread/tokenUsage/updated", {"tokenUsage": None})], gap=0.01)
+    with pytest.raises(CliStallError) as info:
+        asyncio.run(model(rpc, idle_timeout_s=0.1, timeout_s=5).aresponse([Message(role="user", content="hi")]))
+    assert info.value.last_method == "thread/tokenUsage/updated" and info.value.answer_open is False
+
+
+def test_a_completed_answer_is_no_longer_open():
+    done = OPEN_ANSWER + [note("item/completed", {"item": {"id": "i1", "type": "agentMessage", "phase": "final_answer", "text": "x"}})]
+    with pytest.raises(CliStallError) as info:
+        asyncio.run(model(TricklingRpc(done, gap=0.01), idle_timeout_s=0.1, timeout_s=5).aresponse([Message(role="user", content="hi")]))
+    assert info.value.last_method == "item/completed" and info.value.answer_open is False
+
+
+def test_pauses_below_the_idle_limit_do_not_trip():
+    rpc = TricklingRpc(FINAL, gap=0.1)
+    out = asyncio.run(model(rpc, idle_timeout_s=0.5, timeout_s=5).aresponse([Message(role="user", content="hi")]))
+    assert out.content == "hello"
+
+
+def test_wall_clock_still_fires_on_a_slow_but_chatty_stream():
+    rpc = TricklingRpc(OPEN_ANSWER, gap=0.05, forever=True)
+    with pytest.raises(CliTimeoutError) as info:
+        asyncio.run(model(rpc, idle_timeout_s=5, timeout_s=0.5).aresponse([Message(role="user", content="hi")]))
+    assert type(info.value) is CliTimeoutError
+
+
+def test_no_idle_limit_leaves_only_the_wall_clock():
+    rpc = TricklingRpc(OPEN_ANSWER, gap=0.01)
+    with pytest.raises(CliTimeoutError) as info:
+        asyncio.run(model(rpc, idle_timeout_s=None, timeout_s=0.3).aresponse([Message(role="user", content="hi")]))
+    assert type(info.value) is CliTimeoutError
+
+
+def slow_add(a: int, b: int) -> int:
+    """Add slowly.
+
+    Args:
+        a: first
+        b: second
+    """
+    import time
+
+    time.sleep(0.4)
+    return a + b
+
+
+def test_time_spent_in_an_agno_tool_is_not_idle_time():
+    call = {"jsonrpc": "2.0", "id": 7, "method": "item/tool/call", "params": {"callId": "c1", "tool": "slow_add", "arguments": {"a": 2, "b": 5}}}
+    rpc = FakeRpc(script([call]), after_reply={7: FINAL})
+    fn = Function.from_callable(slow_add)
+    fn.process_entrypoint()
+    out = asyncio.run(model(rpc, idle_timeout_s=0.1, timeout_s=5).aresponse([Message(role="user", content="add")], tools=[fn]))
+    assert out.content == "hello"
+
+
+def test_idle_limit_default_and_fingerprint():
+    assert CodexModel().idle_timeout_s == 60.0
+    assert CodexModel(idle_timeout_s=60.0).config_fingerprint() != CodexModel(idle_timeout_s=30.0).config_fingerprint()
+    assert CodexModel(idle_timeout_s=60.0).config_fingerprint() != CodexModel(idle_timeout_s=None).config_fingerprint()
