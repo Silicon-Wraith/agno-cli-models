@@ -396,6 +396,16 @@ def test_stall_before_any_answer_reports_answer_closed():
     assert info.value.last_method == "system:init" and info.value.answer_open is False
 
 
+def test_a_stall_while_resuming_is_not_taken_for_a_stale_session():
+    fake = FakeQuery(after(5, result()))
+    msgs = [Message(role="user", content="q1"),
+            Message(role="assistant", content="a1", provider_data=session_marker("claude", "sess-1")),
+            Message(role="user", content="q2")]
+    with pytest.raises(CliStallError):
+        asyncio.run(model(fake, idle_timeout_s=0.1, timeout_s=5).aresponse(msgs))
+    assert len(fake.calls) == 1 and fake.calls[0][1].resume == "sess-1"
+
+
 def test_a_closed_text_block_is_no_longer_open():
     with pytest.raises(CliStallError) as info:
         ask(model(FakeQuery(INIT, TEXT_START, delta("hi"), TEXT_STOP, after(5, result())), idle_timeout_s=0.1, timeout_s=5))

@@ -113,7 +113,7 @@ Both:
 
 The CLI session id (Claude session or Codex thread) is stored in `provider_data` on assistant messages, so Agno's own history persists it. A new agent instance with the same `session_id` resumes the CLI session. Resume needs `add_history_to_context=True`.
 
-If the stored CLI session no longer exists (its files were cleaned up, or the Agno session moved to another machine), the model logs a warning, starts a new CLI session with the Agno history replayed as a transcript, and stores the new session id. Codex retries only when `thread/resume` gets an error reply. Claude's SDK reports a missing session only as a failed process, so Claude retries when resuming fails before the session starts, unless the failure is a rate limit or context overflow:
+If the stored CLI session no longer exists (its files were cleaned up, or the Agno session moved to another machine), the model logs a warning, starts a new CLI session with the Agno history replayed as a transcript, and stores the new session id. Codex retries only when `thread/resume` gets an error reply. Claude's SDK reports a missing session only as a failed process, so Claude retries when resuming fails before the session starts, unless the failure is a rate limit, a context overflow, or a timeout or stall:
 
 ```python
 from agno.db.sqlite import SqliteDb
@@ -253,7 +253,7 @@ Any other version, or a version that cannot be read, emits `UnsupportedCliVersio
   - **`functions.exec` and `functions.wait`.** These are not a leak: in this model's code mode, every tool call goes through `exec`, including your Agno tools.
 - The tool lists above are what the model reports; Codex does not record the tools it offers. The details are in `reports/2026-10-01-codex-isolation-findings.md`.
 - Every Codex call leaves a session file under `$CODEX_HOME/sessions` containing the prompt.
-- The idle limit may mistake a long API backoff inside the CLI for a stall. Claude Code announces a retry with an `api_retry` system message, and the clock resets on it, but a single backoff longer than `idle_timeout_s` is still raised as `CliStallError`. Codex reconnects are announced the same way, as an `error` notification with `willRetry: true`.
+- The idle limit may mistake a long API backoff inside the CLI for a stall. Per the Agent SDK docs, Claude Code announces a retry with an `api_retry` system message, which resets the clock (not observed on 2.1.287), but a single backoff longer than `idle_timeout_s` is still raised as `CliStallError`. Codex reconnects are announced the same way, as an `error` notification with `willRetry: true`.
 - Claude's SDK bundles its own CLI, but this package uses the `claude` on `PATH` unless `cli_path` is set, so the version you tested is the version you run.
 - Codex needs the `/usr/bin/bwrap` AppArmor profile on Ubuntu 24.04 for its sandbox.
 

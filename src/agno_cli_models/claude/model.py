@@ -22,8 +22,8 @@ from agno_cli_models._common import find_cli_session, last_user_text, session_ma
 from agno_cli_models.claude.matcher import CallIdMatcher
 from agno_cli_models.claude.options import SERVER, build_options, fingerprint
 from agno_cli_models.claude.translate import check_result, observed_model, rate_limit_error, usage_metrics
-from agno_cli_models.errors import (CliProtocolError, CliStallError, ContextWindowExceededError, ModelProviderError,
-                                    ModelRateLimitError)
+from agno_cli_models.errors import (CliProtocolError, CliStallError, CliTimeoutError, ContextWindowExceededError,
+                                    ModelProviderError, ModelRateLimitError)
 from agno_cli_models.versions import check_supported, installed_version
 
 _DONE = object()
@@ -201,7 +201,9 @@ class ClaudeCodeModel(CliModel):
         except ModelProviderError as exc:
             # The SDK reports a missing --resume session only as a failed process with
             # no detail, so any non-quota failure before the init message counts as one.
-            if resume and not state["init"] and not isinstance(exc, (ModelRateLimitError, ContextWindowExceededError)):
+            # A stall is not one: retrying would hide it and double the call.
+            if resume and not state["init"] and not isinstance(
+                    exc, (ModelRateLimitError, ContextWindowExceededError, CliTimeoutError)):
                 raise _StaleSession() from exc
             raise
         finally:
