@@ -70,8 +70,9 @@ Notifications, with time from `turn/start`:
   - `review`: a Sendesis-style security review of a diff. Tools Read, Grep and Glob; nested `output_schema`; the model must read `app.py`.
   - `puzzle`: Hertzsprung's problem for n=8. Long thinking, short answer.
   - `essay`: about 1200 words of plain prose. Long generation, no tools.
+  - `longthink`: a hand-computed recurrence for n=10. Added after the first 12 runs produced little thinking.
 - **Modes:** `nonstream`, where `include_partial_messages` is off and the SDK yields whole messages, and `stream`, where it is on.
-- **Runs:** 2 repetitions of each shape and mode, 12 runs in all, run one after another.
+- **Runs:** one after another. 2 repetitions of each mode for `review`, `puzzle` and `essay` (12 runs), then 1 of each mode for `longthink` (2 runs), 14 in all.
 - **Raw data:** `reports/2026-10-01-substrate-checks-claude.jsonl`. Each line has every message's arrival time and kind, the top 5 gaps and the message pair bounding each.
 
 **Already visible in a Haiku smoke run:** the CLI sends `system:thinking_tokens` progress messages *during thinking*, even in non-stream mode. In stream mode, thinking also arrives as `thinking_delta` events. Thinking is therefore not silent at the SDK layer.
@@ -105,9 +106,13 @@ The 12 planned runs, plus 2 `longthink` runs, one per mode. Those were added bec
 ### Limits of this measurement
 
 - **Thinking for minutes was not produced** at effort `high` on claude-opus-5-5. The longest stretch was 18 s, so constant cadence during much longer thinking is assumed from the 1.2–1.7 s `thinking_tokens` rhythm, not observed.
-- **Not covered:**
-  - Claude Code's own API retries and backoff, on overload or 5xx. None occurred, and it is not known whether the CLI sends messages while backing off.
-  - Very slow tools. A slow Agno tool runs in the caller's process, and the idle clock should not count that time against the CLI.
-  - Rate-limit waits.
+- **Not observed in these runs:**
+  - Claude Code's own API retries and backoff, on overload or 5xx.
+  - Slow tools.
+  - Rate-limit waits. The `RateLimitEvent` messages in the raw data are the CLI's routine usage-status updates, not limits being hit; every run completed.
+- **What the Agent SDK docs say about those cases** (code.claude.com/docs/en/agent-sdk), not verified on this CLI and SDK version:
+  - The message union includes an `SDKAPIRetryMessage` (`api_retry`), so a backoff is announced, not silent. A single backoff longer than the idle limit would still go quiet between the announcement and the retry.
+  - While a tool call runs in the main conversation, Claude Code sends a `tool_progress` heartbeat every 30 s. With heartbeats, a slow tool would not trip a 60 s limit. Without them, the idle clock in request 4 should pause while an Agno tool runs in the caller's process.
+  - Request 4 should verify both with a fake or a forced case.
 - **The result is specific to** Claude Code 2.1.287, claude-opus-5-5 and effort `high`. Re-measure with `tools/measure_cadence.py` when any of them changes.
 - **Sample size:** 14 runs, all on 2026-10-01, sequential, on one machine.
