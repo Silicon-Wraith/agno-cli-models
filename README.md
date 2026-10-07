@@ -231,6 +231,26 @@ from agno_cli_models.errors import ContextWindowExceededError
 
 Because rate limits use Agno's classes, Agno's `FallbackConfig(on_rate_limit=[...])` works with these models without extra code.
 
+## Claude without Agno
+
+`tools/claude_isolated.py` is a single file that needs only `claude-agent-sdk`. It is for running one isolated Claude Code call from a script, or from another agent such as Codex, without Agno. It is not part of the installed package: copy the file where you need it.
+
+It has the same isolation, API-key blanking, wall clock, idle limit, typed errors (`ClaudeStallError`, `ClaudeTimeoutError`, `ClaudeRateLimitError` and others), version check, structured output and session resume as `ClaudeCodeModel`. It has no Agno tools, approval pauses or stale-session fallback.
+
+```bash
+python tools/claude_isolated.py "Review app.py" --cwd /repo --tools Read,Grep,Glob --schema review.schema.json --json
+python tools/claude_isolated.py "And the other file?" --resume <session id> --stream
+```
+
+```python
+import asyncio
+from claude_isolated import ask   # with tools/ on sys.path
+r = asyncio.run(ask("Review app.py", cwd="/repo", tools=("Read", "Grep")))
+print(r.text, r.session_id, r.usage)
+```
+
+The file carries its own copies of the isolation settings, env policy, tested versions and fingerprint. `tests/test_claude_isolated.py` fails when they drift from the package.
+
 ## Supported CLI versions
 
 Tested against Claude Code `2.1.286` and `2.1.287`, and codex-cli `0.155.1`:
